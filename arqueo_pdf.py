@@ -110,7 +110,7 @@ def get_bsale_products():
     return pd.DataFrame(products)
 
 def find_matches(pdf_data, bsale_df):
-    """Encuentra coincidencias entre modelos del PDF y productos Bsale"""
+    """Encuentra coincidencias y calcula nota de crédito solo para stock con costo viejo diferente"""
     matches = []
     
     for pdf_item in pdf_data:
@@ -125,23 +125,58 @@ def find_matches(pdf_data, bsale_df):
                 stock = row['stock']
                 costo_viejo = row['costo_promedio']
                 
-                valor_inventario_viejo = stock * costo_viejo
-                valor_inventario_nuevo = stock * nuevo_precio
-                diferencia = valor_inventario_nuevo - valor_inventario_viejo
-                
-                matches.append({
-                    'modelo_pdf': model,
-                    'producto_bsale': row['product_name'],
-                    'variante': row['variant_desc'],
-                    'codigo': row['variant_code'],
-                    'stock': stock,
-                    'costo_viejo': costo_viejo,
-                    'precio_nuevo': nuevo_precio,
-                    'valor_inventario_viejo': valor_inventario_viejo,
-                    'valor_inventario_nuevo': valor_inventario_nuevo,
-                    'diferencia': diferencia,
-                    'match': True
-                })
+                # Solo procesar si hay stock y hay diferencia de precio
+                if stock > 0 and costo_viejo > 0 and costo_viejo != nuevo_precio:
+                    valor_inventario_viejo = stock * costo_viejo
+                    valor_inventario_nuevo = stock * nuevo_precio
+                    diferencia = valor_inventario_nuevo - valor_inventario_viejo
+                    
+                    matches.append({
+                        'modelo_pdf': model,
+                        'producto_bsale': row['product_name'],
+                        'variante': row['variant_desc'],
+                        'codigo': row['variant_code'],
+                        'stock': stock,
+                        'costo_viejo': costo_viejo,
+                        'precio_nuevo': nuevo_precio,
+                        'valor_inventario_viejo': valor_inventario_viejo,
+                        'valor_inventario_nuevo': valor_inventario_nuevo,
+                        'diferencia': diferencia,
+                        'necesita_ajuste': True,
+                        'match': True
+                    })
+                elif stock > 0 and costo_viejo > 0 and costo_viejo == nuevo_precio:
+                    # Ya tiene el precio nuevo, no necesita ajuste
+                    matches.append({
+                        'modelo_pdf': model,
+                        'producto_bsale': row['product_name'],
+                        'variante': row['variant_desc'],
+                        'codigo': row['variant_code'],
+                        'stock': stock,
+                        'costo_viejo': costo_viejo,
+                        'precio_nuevo': nuevo_precio,
+                        'valor_inventario_viejo': stock * costo_viejo,
+                        'valor_inventario_nuevo': stock * nuevo_precio,
+                        'diferencia': 0,
+                        'necesita_ajuste': False,
+                        'match': True
+                    })
+                else:
+                    # Sin stock o sin costo
+                    matches.append({
+                        'modelo_pdf': model,
+                        'producto_bsale': row['product_name'],
+                        'variante': row['variant_desc'],
+                        'codigo': row['variant_code'],
+                        'stock': stock,
+                        'costo_viejo': costo_viejo,
+                        'precio_nuevo': nuevo_precio,
+                        'valor_inventario_viejo': 0,
+                        'valor_inventario_nuevo': 0,
+                        'diferencia': 0,
+                        'necesita_ajuste': False,
+                        'match': True
+                    })
         else:
             matches.append({
                 'modelo_pdf': model,
@@ -154,6 +189,7 @@ def find_matches(pdf_data, bsale_df):
                 'valor_inventario_viejo': 0,
                 'valor_inventario_nuevo': 0,
                 'diferencia': 0,
+                'necesita_ajuste': False,
                 'match': False
             })
     
@@ -193,69 +229,87 @@ if uploaded_file:
             total_pdf = len(pdf_data)
             matched = len(results[results['match'] == True])
             no_match = total_pdf - matched
-            total_diferencia = results['diferencia'].sum()
+            
+            # Solo contar los que necesitan ajuste real
+            necesita_ajuste = results[results['necesita_ajuste'] == True]
+            ya_actualizado = results[(results['match'] == True) & (results['necesita_ajuste'] == False) & (results['stock'] > 0)]
+            sin_stock = results[(results['match'] == True) & (results['stock'] == 0)]
+            
+            total_diferencia = necesita_ajuste['diferencia'].sum() if len(necesita_ajuste) > 0 else 0
             
             st.markdown('<div class="section-title">📊 Resumen del Arqueo</div>', unsafe_allow_html=True)
             m1, m2, m3, m4 = st.columns(4)
-            m1.markdown(f'<div class="metric-card"><div class="metric-value">{total_pdf}</div><div class="metric-label">Modelos en PDF</div></div>', unsafe_allow_html=True)
-            m2.markdown(f'<div class="metric-card"><div class="metric-value">{matched}</div><div class="metric-label">Coincidencias</div></div>', unsafe_allow_html=True)
-            m3.markdown(f'<div class="metric-card"><div class="metric-value">{no_match}</div><div class="metric-label">Sin Coincidencia</div></div>', unsafe_allow_html=True)
+            m1.markdown(f'<div class="metric-card"><div class="metric-value">{len(necesita_ajuste)}</div><div class="metric-label">Necesitan Ajuste</div></div>', unsafe_allow_html=True)
+            m2.markdown(f'<div class="metric-card"><div class="metric-value">{len(ya_actualizado)}</div><div class="metric-label">Ya Actualizados</div></div>', unsafe_allow_html=True)
+            m3.markdown(f'<div class="metric-card"><div class="metric-value">{len(sin_stock)}</div><div class="metric-label">Sin Stock</div></div>', unsafe_allow_html=True)
             m4.markdown(f'<div class="metric-card"><div class="metric-value">${total_diferencia:,.2f}</div><div class="metric-label">Diferencia Total</div></div>', unsafe_allow_html=True)
             
             # Tabla detallada
             st.markdown('<div class="section-title">📋 Detalle del Arqueo</div>', unsafe_allow_html=True)
             
             # Separar en tabs
-            tab1, tab2 = st.tabs(["✅ Con Coincidencia", "❌ Sin Coincidencia"])
+            tab1, tab2, tab3 = st.tabs(["🔴 Necesitan Ajuste", "🟢 Ya Actualizados", "⚪ Sin Stock / No Encontrado"])
             
             with tab1:
-                df_match = results[results['match'] == True].copy()
-                if not df_match.empty:
-                    df_match['costo_viejo'] = df_match['costo_viejo'].apply(lambda x: f"${x:,.2f}")
-                    df_match['precio_nuevo'] = df_match['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                    df_match['valor_inventario_viejo'] = df_match['valor_inventario_viejo'].apply(lambda x: f"${x:,.2f}")
-                    df_match['valor_inventario_nuevo'] = df_match['valor_inventario_nuevo'].apply(lambda x: f"${x:,.2f}")
-                    df_match['diferencia'] = df_match['diferencia'].apply(lambda x: f"${x:,.2f}")
+                if not necesita_ajuste.empty:
+                    df_display = necesita_ajuste.copy()
+                    df_display['costo_viejo'] = df_display['costo_viejo'].apply(lambda x: f"${x:,.2f}")
+                    df_display['precio_nuevo'] = df_display['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
+                    df_display['valor_inventario_viejo'] = df_display['valor_inventario_viejo'].apply(lambda x: f"${x:,.2f}")
+                    df_display['valor_inventario_nuevo'] = df_display['valor_inventario_nuevo'].apply(lambda x: f"${x:,.2f}")
+                    df_display['diferencia'] = df_display['diferencia'].apply(lambda x: f"${x:,.2f}")
                     
                     st.dataframe(
-                        df_match[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'costo_viejo', 'precio_nuevo', 'valor_inventario_viejo', 'valor_inventario_nuevo', 'diferencia']],
+                        df_display[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'costo_viejo', 'precio_nuevo', 'valor_inventario_viejo', 'valor_inventario_nuevo', 'diferencia']],
                         use_container_width=True,
                         height=400
                     )
+                    
+                    # Nota de crédito
+                    st.markdown('<div class="section-title">📝 Nota de Crédito (Cálculo)</div>', unsafe_allow_html=True)
+                    total_viejo = necesita_ajuste['valor_inventario_viejo'].sum()
+                    total_nuevo = necesita_ajuste['valor_inventario_nuevo'].sum()
+                    ajuste = total_nuevo - total_viejo
+                    
+                    st.write(f"**Valor Inventario Actual (costos viejos):** ${total_viejo:,.2f}")
+                    st.write(f"**Valor Inventario con Nuevos Precios:** ${total_nuevo:,.2f}")
+                    st.write(f"**Ajuste / Nota de Crédito:** ${ajuste:,.2f}")
+                    
+                    if ajuste > 0:
+                        st.info(f"📈 El inventario aumentaría de valor en ${ajuste:,.2f}")
+                    elif ajuste < 0:
+                        st.info(f"📉 El inventario disminuiría de valor en ${abs(ajuste):,.2f}")
+                    else:
+                        st.success("✅ No hay diferencia de valor")
                 else:
-                    st.info("No hay coincidencias encontradas")
+                    st.success("✅ Ningún producto necesita ajuste. Todos tienen precio actualizado o no hay stock.")
             
             with tab2:
-                df_no_match = results[results['match'] == False].copy()
-                if not df_no_match.empty:
+                if not ya_actualizado.empty:
+                    df_display = ya_actualizado.copy()
+                    df_display['costo_viejo'] = df_display['costo_viejo'].apply(lambda x: f"${x:,.2f}")
+                    df_display['precio_nuevo'] = df_display['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
                     st.dataframe(
-                        df_no_match[['modelo_pdf', 'precio_nuevo']],
+                        df_display[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'costo_viejo', 'precio_nuevo']],
                         use_container_width=True,
-                        height=200
+                        height=300
                     )
+                    st.info("ℹ️ Estos productos ya tienen el precio nuevo. No necesitan ajuste.")
+                else:
+                    st.info("No hay productos ya actualizados.")
+            
+            with tab3:
+                df_sin_stock = results[(results['match'] == True) & (results['stock'] == 0)].copy()
+                df_no_match = results[results['match'] == False].copy()
+                
+                if not df_sin_stock.empty:
+                    st.write("**Sin Stock:**")
+                    st.dataframe(df_sin_stock[['modelo_pdf', 'producto_bsale']], use_container_width=True, height=150)
+                
+                if not df_no_match.empty:
+                    st.write("**No Encontrado en Bsale:**")
+                    st.dataframe(df_no_match[['modelo_pdf', 'precio_nuevo']], use_container_width=True, height=150)
                     st.warning("⚠️ Estos modelos no se encontraron en Bsale. Verifica los nombres o códigos.")
-                else:
-                    st.success("¡Todos los modelos tienen coincidencia!")
-            
-            # Nota de crédito
-            st.markdown('<div class="section-title">📝 Nota de Crédito (Cálculo)</div>', unsafe_allow_html=True)
-            
-            df_credit = results[results['match'] == True].copy()
-            if not df_credit.empty:
-                total_viejo = df_credit['valor_inventario_viejo'].sum()
-                total_nuevo = df_credit['valor_inventario_nuevo'].sum()
-                ajuste = total_nuevo - total_viejo
-                
-                st.write(f"**Valor Inventario Actual (costos viejos):** ${total_viejo:,.2f}")
-                st.write(f"**Valor Inventario con Nuevos Precios:** ${total_nuevo:,.2f}")
-                st.write(f"**Ajuste / Nota de Crédito:** ${ajuste:,.2f}")
-                
-                if ajuste > 0:
-                    st.info(f"📈 El inventario aumentaría de valor en ${ajuste:,.2f}")
-                elif ajuste < 0:
-                    st.info(f"📉 El inventario disminuiría de valor en ${abs(ajuste):,.2f}")
-                else:
-                    st.success("✅ No hay diferencia de valor")
             
             # Descargar CSV
             csv = results.to_csv(index=False).encode('utf-8')
