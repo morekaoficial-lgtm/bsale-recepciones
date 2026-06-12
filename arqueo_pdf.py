@@ -363,11 +363,52 @@ else:
                     else:
                         st.info("No hay.")
                 
-                # Descargas
+                # --- DESCARGA UNIFICADA ---
+                # Preparar DataFrame unificado: encontrados + no encontrados
+                # Encontrados: marcar como "Encontrado"
+                matches_export = matches_df.copy() if not matches_df.empty else pd.DataFrame()
+                if not matches_export.empty:
+                    matches_export['estado'] = 'Encontrado'
+                
+                # No encontrados: agregar columnas vacías para que coincidan con el formato
+                not_found_export = not_found.copy() if not not_found.empty else pd.DataFrame()
+                if not not_found_export.empty:
+                    not_found_export['estado'] = 'No Encontrado'
+                    not_found_export['producto_bsale'] = ''
+                    not_found_export['variante'] = ''
+                    not_found_export['codigo'] = ''
+                    not_found_export['stock'] = 0
+                    not_found_export['variant_id'] = ''
+                    not_found_export['costo_viejo'] = 0
+                    not_found_export['valor_viejo'] = 0
+                    not_found_export['valor_nuevo'] = 0
+                    not_found_export['diferencia'] = 0
+                    not_found_export['necesita_ajuste'] = False
+                
+                # Unir ambos
+                if not matches_export.empty and not not_found_export.empty:
+                    unified_df = pd.concat([matches_export, not_found_export], ignore_index=True)
+                elif not matches_export.empty:
+                    unified_df = matches_export
+                elif not not_found_export.empty:
+                    unified_df = not_found_export
+                else:
+                    unified_df = pd.DataFrame()
+                
+                if not unified_df.empty:
+                    st.download_button(
+                        "⬇️ Descargar Arqueo Completo (CSV)", 
+                        unified_df.to_csv(index=False).encode('utf-8'), 
+                        f"arqueo_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", 
+                        "text/csv", 
+                        use_container_width=True
+                    )
+                
+                # Descargas separadas (opcional, por si las necesita)
                 if not matches_df.empty:
-                    st.download_button("⬇️ Arqueo CSV", matches_df.to_csv(index=False).encode('utf-8'), f"arqueo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
+                    st.download_button("⬇️ Solo Encontrados (CSV)", matches_df.to_csv(index=False).encode('utf-8'), f"arqueo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
                 if not not_found.empty:
-                    st.download_button("⬇️ No Encontrados CSV", not_found.to_csv(index=False).encode('utf-8'), f"no_encontrados_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
+                    st.download_button("⬇️ Solo No Encontrados (CSV)", not_found.to_csv(index=False).encode('utf-8'), f"no_encontrados_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
         else:
             st.error("❌ No se extrajeron modelos del PDF.")
 
