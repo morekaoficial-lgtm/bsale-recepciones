@@ -12,6 +12,7 @@ st.set_page_config(page_title="Bsale - Arqueo de Precios (PDF)", page_icon="📊
 ACCESS_TOKEN = "027fa2348b50d5ecd2d2a469f07c464e85cf176d"
 BASE_URL = "https://api.bsale.io/v1"
 HEADERS = {"access_token": ACCESS_TOKEN, "Content-Type": "application/json"}
+RATE_LIMIT = 10  # requests per second (Bsale limit)
 
 # ==================== CSS ====================
 st.markdown("""
@@ -48,10 +49,8 @@ def fetch_page(offset, limit=50):
     results = []
     for item in items:
         prod_name = item.get('name', '')
-        # expand=variants ya incluye las variantes en el producto
         variants = item.get('variants', {}).get('items', [])
         if not variants:
-            # Fallback: algunas respuestas no expanden bien
             var_url = f"{BASE_URL}/products/{item.get('id')}/variants.json"
             v_data = get_json(var_url)
             variants = v_data.get('items', [])
@@ -68,9 +67,26 @@ def fetch_page(offset, limit=50):
     
     return results, len(items)
 
+def fetch_reception_page(offset, limit=50):
+    """Fetch una página de recepciones con details inline"""
+    url = f"{BASE_URL}/stocks/receptions.json?limit={limit}&offset={offset}&expand=[details]"
+    data = get_json(url)
+    items = data.get('items', [])
+    
+    all_details = []
+    for item in items:
+        details = item.get('details', {})
+        if isinstance(details, dict) and 'items' in details:
+            all_details.extend(details.get('items', []))
+        elif isinstance(details, dict) and 'href' in details:
+            # fallback si expand no funcionó
+            d_data = get_json(details['href'])
+            all_details.extend(d_data.get('items', []))
+    
+    return all_details, len(items)
+
 def fetch_all_products_fast():
     """Obtiene todos los productos en paralelo"""
-    # Primero, obtener conteo total
     data = get_json(f"{BASE_URL}/products.json?limit=1&offset=0")
     total_count = data.get('count', 0)
     
@@ -96,49 +112,59 @@ def fetch_all_products_fast():
     
     return pd.DataFrame(all_results)
 
-def get_reception_cost_for_variants(variant_ids):
-    """Obtiene costos de recepción SOLO para las variantes que necesitamos"""
+def get_reception_costs_for_variants(needed_variant_ids):
+    """Obtiene costos de recepción SOLO para variantes necesarias — ultra rápido"""
     costs_map = {}
-    needed = set(str(v) for v in variant_ids)
-    
+    needed = set(str(v) for v in needed_variant_ids)
     if not needed:
         return costs_map
     
-    # Buscar recepciones recientes primero
-    all_receptions = []
-    offset = 0
+    # Obtener conteo total de recepciones
+    data = get_json(f"{BASE_URL}/stocks/receptions.json?limit=1&offset=0")
+    total_count = data.get('count', 0)
+    
+    if total_count == 0:
+        return costs_map
+    
     limit = 50
-    
-    while True:
-        url = f"{BASE_URL}/stocks/receptions.json?limit={limit}&offset={offset}"
-        data = get_json(url)
-        items = data.get('items', [])
-        if not items:
-            break
-        all_receptions.extend(items)
-        if len(items) < limit:
-            break
-        offset += limit
-    
-    all_receptions.sort(key=lambda x: x.get('admissionDate', 0), reverse=True)
+    offsets = list(range(0, total_count, limit))
     
     found_count = 0
-    for item in all_receptions:
-        if found_count >= len(needed):
-            break
-        
-        reception_id = item.get('id')
-        details_url = f"{BASE_URL}/stocks/receptions/{reception_id}/details.json"
-        d_data = get_json(details_url)
-        d_items = d_data.get('items', [])
-        
-        for d in d_items:
-            v_id = str(d.get('variant', {}).get('id', ''))
-            cost = d.get('cost', 0)
-            if v_id in needed and cost > 0 and v_id not in costs_map:
-                costs_map[v_id] = cost
-                found_count += 1
+    total_needed = len(needed)
     
+    # Progreso
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text(f"Buscando costos en {total_count} recepciones...")
+    
+    with ThreadPoolExecutor(max_workers=RATE_LIMIT) as executor:
+        futures = {executor.submit(fetch_reception_page, off, limit): off for off in offsets}
+        
+        completed = 0
+        total_pages = len(offsets)
+        
+        for future in as_completed(futures):
+            details, count = future.result()
+            completed += 1
+            progress_bar.progress(min(completed / total_pages, 1.0))
+            status_text.text(f"Procesando página {completed}/{total_pages}... ({found_count}/{total_needed} encontrados)")
+            
+            for d in details:
+                v_id = str(d.get('variant', {}).get('id', ''))
+                cost = d.get('cost', 0)
+                if v_id in needed and cost > 0 and v_id not in costs_map:
+                    costs_map[v_id] = cost
+                    found_count += 1
+            
+            # Early stop: si ya encontramos todos los que necesitamos
+            if found_count >= total_needed:
+                # Cancelar futuros pendientes
+                for f in futures:
+                    f.cancel()
+                break
+    
+    progress_bar.empty()
+    status_text.empty()
     return costs_map
 
 # ==================== EXTRACCIÓN PDF ====================
@@ -173,11 +199,11 @@ def extract_pdf_data(pdf_file):
 
 # ==================== ARQUEO ====================
 def do_arqueo_fast(pdf_data, bsale_df):
-    """Arqueo optimizado - solo busca variantes relevantes"""
+    """Arqueo optimizado — matching en memoria"""
     matches = []
     not_found = []
     
-    # Pre-filtrar: crear diccionario de modelo -> variantes
+    # Pre-construir diccionario de modelo → variantes
     model_to_variants = {}
     for _, row in bsale_df.iterrows():
         name = row['product_name'].upper()
@@ -188,25 +214,21 @@ def do_arqueo_fast(pdf_data, bsale_df):
                     model_to_variants[model] = []
                 model_to_variants[model].append(row)
     
-    # Procesar cada modelo del PDF
     for pdf_item in pdf_data:
         model = pdf_item['modelo']
         nuevo_precio = pdf_item['precio_nuevo']
         
         if model in model_to_variants:
             for row in model_to_variants[model]:
-                stock = row['stock']
-                variant_id = str(row['variant_id'])
-                # Costo se resuelve después con reception costs
                 matches.append({
                     'modelo_pdf': model,
                     'producto_bsale': row['product_name'],
                     'variante': row['variant_desc'],
                     'codigo': row['variant_code'],
-                    'stock': stock,
-                    'variant_id': variant_id,
+                    'stock': row['stock'],
+                    'variant_id': str(row['variant_id']),
                     'precio_nuevo': nuevo_precio,
-                    'costo_viejo': row['costo_promedio'],  # temporal
+                    'costo_viejo': row['costo_promedio'],
                 })
         else:
             not_found.append({
@@ -237,7 +259,7 @@ if st.session_state.step == 1:
             bsale_df = fetch_all_products_fast()
             st.session_state.bsale_df = bsale_df
             st.session_state.step = 2
-        st.success(f"✅ **{len(bsale_df)}** variantes cargadas en segundos")
+        st.success(f"✅ **{len(bsale_df)}** variantes cargadas")
         st.rerun()
 
 # --- PASO 2: SUBIR PDF Y ARQUEAR ---
@@ -261,9 +283,8 @@ else:
                 
                 # Obtener costos de recepción SOLO para variantes encontradas
                 if not matches_df.empty:
-                    with st.spinner("Obteniendo costos de recepción..."):
-                        variant_ids = matches_df['variant_id'].unique().tolist()
-                        reception_costs = get_reception_cost_for_variants(variant_ids)
+                    variant_ids = matches_df['variant_id'].unique().tolist()
+                    reception_costs = get_reception_costs_for_variants(variant_ids)
                     
                     # Aplicar costos de recepción
                     for idx, row in matches_df.iterrows():
@@ -271,7 +292,7 @@ else:
                         if v_id in reception_costs:
                             matches_df.at[idx, 'costo_viejo'] = reception_costs[v_id]
                     
-                    # Calcular valores
+                    # Calcular
                     matches_df['valor_viejo'] = matches_df['stock'] * matches_df['costo_viejo']
                     matches_df['valor_nuevo'] = matches_df['stock'] * matches_df['precio_nuevo']
                     matches_df['diferencia'] = matches_df['valor_nuevo'] - matches_df['valor_viejo']
@@ -314,7 +335,6 @@ else:
                         d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
                         st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'valor_nuevo', 'diferencia']], use_container_width=True, height=350)
                         
-                        # Nota de crédito
                         total_v = necesita_ajuste['valor_viejo'].sum()
                         total_n = necesita_ajuste['valor_nuevo'].sum()
                         ajuste = total_n - total_v
@@ -351,4 +371,4 @@ else:
         else:
             st.error("❌ No se extrajeron modelos del PDF.")
 
-st.markdown("""<div style="text-align: center; color: #888; margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #e9ecef;">Bsale Arqueo PDF | Optimizado</div>""", unsafe_allow_html=True)
+st.markdown("""<div style="text-align: center; color: #888; margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #e9ecef;">Bsale Arqueo PDF | Ultra-rápido</div>""", unsafe_allow_html=True)
