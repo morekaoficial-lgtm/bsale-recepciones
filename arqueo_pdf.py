@@ -38,7 +38,6 @@ def extract_pdf_data(pdf_file):
                 text += page.extract_text() + "\n"
         
         # Patrón: líneas que empiezan con $precio seguido de modelo
-        # Ejemplo: $375.0 A37 20 BOCINA/蓝牙音响 ...
         pattern = r'^\$(\d+(?:\.\d+)?)\s+([A-Z]\d+)\s+(\d+(?:\([^)]*\))?)\s+(.*?)$'
         
         data = []
@@ -47,7 +46,6 @@ def extract_pdf_data(pdf_file):
             match = re.match(pattern, line.strip())
             if match:
                 price, model, pieces, rest = match.groups()
-                # El nombre está hasta el primer caracter chino o slash
                 name_parts = rest.split(' ')
                 name = name_parts[0] if name_parts else ''
                 
@@ -83,7 +81,6 @@ def get_bsale_products():
                 prod_id = item.get('id')
                 prod_name = item.get('name', '')
                 
-                # Obtener variantes
                 var_url = f"{BASE_URL}/products/{prod_id}/variants.json"
                 v_resp = requests.get(var_url, headers=HEADERS, timeout=30)
                 if v_resp.status_code == 200:
@@ -109,23 +106,65 @@ def get_bsale_products():
     
     return pd.DataFrame(products)
 
-def find_matches(pdf_data, bsale_df):
-    """Encuentra coincidencias y calcula nota de crédito solo para stock con costo viejo diferente"""
+def get_reception_costs_map():
+    """Obtiene un mapa de variant_id -> costo de la última recepción"""
+    costs_map = {}
+    try:
+        all_receptions = []
+        offset = 0
+        while True:
+            url = f"{BASE_URL}/stocks/receptions.json?limit=50&offset={offset}"
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            items = data.get('items', [])
+            if not items:
+                break
+            all_receptions.extend(items)
+            if len(items) < 50:
+                break
+            offset += 50
+        
+        # Ordenar por admissionDate descendente (más reciente primero)
+        all_receptions.sort(key=lambda x: x.get('admissionDate', 0), reverse=True)
+        
+        for item in all_receptions:
+            reception_id = item.get('id')
+            details_url = f"{BASE_URL}/stocks/receptions/{reception_id}/details.json"
+            d_resp = requests.get(details_url, headers=HEADERS, timeout=30)
+            if d_resp.status_code == 200:
+                d_data = d_resp.json()
+                d_items = d_data.get('items', [])
+                for d in d_items:
+                    v_id = str(d.get('variant', {}).get('id', ''))
+                    cost = d.get('cost', 0)
+                    if v_id and cost > 0 and v_id not in costs_map:
+                        costs_map[v_id] = cost
+        
+        return costs_map
+    except Exception as e:
+        st.error(f"Error obteniendo costos de recepciones: {e}")
+        return costs_map
+
+def find_matches(pdf_data, bsale_df, reception_costs):
+    """Encuentra coincidencias y calcula nota de crédito usando costo de recepción"""
     matches = []
     
     for pdf_item in pdf_data:
         model = pdf_item['modelo']
         nuevo_precio = pdf_item['precio_nuevo']
         
-        # Buscar productos de Bsale que contengan el modelo en el nombre
         matching = bsale_df[bsale_df['product_name'].str.contains(model, case=False, na=False)]
         
         if not matching.empty:
             for _, row in matching.iterrows():
                 stock = row['stock']
-                costo_viejo = row['costo_promedio']
+                variant_id = str(row['variant_id'])
                 
-                # Solo procesar si hay stock y hay diferencia de precio
+                # Usar costo de recepción si existe, sino costo promedio como fallback
+                costo_viejo = reception_costs.get(variant_id, row['costo_promedio'])
+                
                 if stock > 0 and costo_viejo > 0 and costo_viejo != nuevo_precio:
                     valor_inventario_viejo = stock * costo_viejo
                     valor_inventario_nuevo = stock * nuevo_precio
@@ -146,7 +185,6 @@ def find_matches(pdf_data, bsale_df):
                         'match': True
                     })
                 elif stock > 0 and costo_viejo > 0 and costo_viejo == nuevo_precio:
-                    # Ya tiene el precio nuevo, no necesita ajuste
                     matches.append({
                         'modelo_pdf': model,
                         'producto_bsale': row['product_name'],
@@ -162,7 +200,6 @@ def find_matches(pdf_data, bsale_df):
                         'match': True
                     })
                 else:
-                    # Sin stock o sin costo
                     matches.append({
                         'modelo_pdf': model,
                         'producto_bsale': row['product_name'],
@@ -199,38 +236,35 @@ def find_matches(pdf_data, bsale_df):
 st.markdown('<div class="main-header">📊 Bsale — Arqueo de Precios (PDF)</div>', unsafe_allow_html=True)
 st.markdown('<div class="subheader">Sube un PDF de lista de precios VIP y compara con tu inventario actual en Bsale</div>', unsafe_allow_html=True)
 
-# Upload PDF
-st.markdown('<div class="section-title">📁 Subir PDF de Lista de Precios</div>', unsafe_allow_html=True)
 uploaded_file = st.file_uploader("Selecciona el PDF (lista VIP de proveedor)", type=['pdf'])
 
 if uploaded_file:
-    # Extraer datos del PDF
     with st.spinner("Extrayendo datos del PDF..."):
         pdf_data = extract_pdf_data(io.BytesIO(uploaded_file.read()))
     
     if pdf_data:
         st.success(f"✅ Se encontraron {len(pdf_data)} modelos en el PDF")
         
-        # Mostrar preview del PDF
         df_preview = pd.DataFrame(pdf_data)
         st.dataframe(df_preview, use_container_width=True, height=200)
         
-        # Conectar con Bsale
         st.markdown('<div class="section-title">🔍 Conectar con Bsale y Arquear</div>', unsafe_allow_html=True)
         
         if st.button("🔄 Buscar en Bsale y Arquear", type="primary", use_container_width=True):
             with st.spinner("Obteniendo productos de Bsale..."):
                 bsale_df = get_bsale_products()
             
-            with st.spinner("Haciendo arqueo..."):
-                results = find_matches(pdf_data, bsale_df)
+            with st.spinner("Obteniendo costos de recepciones..."):
+                reception_costs = get_reception_costs_map()
+                st.info(f"💡 Costos de recepción encontrados para {len(reception_costs)} variantes")
             
-            # Métricas
+            with st.spinner("Haciendo arqueo..."):
+                results = find_matches(pdf_data, bsale_df, reception_costs)
+            
             total_pdf = len(pdf_data)
             matched = len(results[results['match'] == True])
             no_match = total_pdf - matched
             
-            # Solo contar los que necesitan ajuste real
             necesita_ajuste = results[results['necesita_ajuste'] == True]
             ya_actualizado = results[(results['match'] == True) & (results['necesita_ajuste'] == False) & (results['stock'] > 0)]
             sin_stock = results[(results['match'] == True) & (results['stock'] == 0)]
@@ -244,10 +278,8 @@ if uploaded_file:
             m3.markdown(f'<div class="metric-card"><div class="metric-value">{len(sin_stock)}</div><div class="metric-label">Sin Stock</div></div>', unsafe_allow_html=True)
             m4.markdown(f'<div class="metric-card"><div class="metric-value">${total_diferencia:,.2f}</div><div class="metric-label">Diferencia Total</div></div>', unsafe_allow_html=True)
             
-            # Tabla detallada
             st.markdown('<div class="section-title">📋 Detalle del Arqueo</div>', unsafe_allow_html=True)
             
-            # Separar en tabs
             tab1, tab2, tab3 = st.tabs(["🔴 Necesitan Ajuste", "🟢 Ya Actualizados", "⚪ Sin Stock / No Encontrado"])
             
             with tab1:
@@ -265,7 +297,6 @@ if uploaded_file:
                         height=400
                     )
                     
-                    # Nota de crédito
                     st.markdown('<div class="section-title">📝 Nota de Crédito (Cálculo)</div>', unsafe_allow_html=True)
                     total_viejo = necesita_ajuste['valor_inventario_viejo'].sum()
                     total_nuevo = necesita_ajuste['valor_inventario_nuevo'].sum()
@@ -311,7 +342,6 @@ if uploaded_file:
                     st.dataframe(df_no_match[['modelo_pdf', 'precio_nuevo']], use_container_width=True, height=150)
                     st.warning("⚠️ Estos modelos no se encontraron en Bsale. Verifica los nombres o códigos.")
             
-            # Descargar CSV
             csv = results.to_csv(index=False).encode('utf-8')
             st.download_button(
                 "⬇️ Descargar Resultado (CSV)",
@@ -323,7 +353,6 @@ if uploaded_file:
     else:
         st.error("❌ No se pudieron extraer modelos del PDF. Verifica que sea un PDF de lista VIP válido.")
 
-# Footer
 st.markdown("""
 <div style="text-align: center; color: #888; margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #e9ecef;">
     Conectado a Bsale API | Sube un PDF de lista VIP para comenzar
