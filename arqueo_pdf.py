@@ -169,7 +169,7 @@ def get_reception_costs_for_variants(needed_variant_ids):
 
 # ==================== EXTRACCIÓN PDF ====================
 def extract_pdf_data(pdf_file):
-    """Extrae modelo y precio del PDF de lista VIP"""
+    """Extrae modelo y precio del PDF de lista VIP — soporta múltiples formatos"""
     try:
         import pdfplumber
         with pdfplumber.open(pdf_file) as pdf:
@@ -177,19 +177,80 @@ def extract_pdf_data(pdf_file):
             for page in pdf.pages:
                 text += page.extract_text() + "\n"
         
-        pattern = r'^\$(\d+(?:\.\d+)?)\s+([A-Z]\d+)\s+(\d+(?:\([^)]*\))?)\s+(.*?)$'
-        
         data = []
         for line in text.split('\n'):
-            match = re.match(pattern, line.strip())
-            if match:
-                price, model, pieces, rest = match.groups()
-                name = rest.split(' ')[0] if rest else ''
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Detectar si es línea de agotado o con precio
+            is_agotado = line.lower().startswith('agotado')
+            
+            if is_agotado:
+                # Formato: agotado [MODELO] [cantidad] [nombre]
+                tokens = line.split()
+                if len(tokens) < 3:
+                    continue
+                model = tokens[1]
+                # Cantidad: tercer token (número, posiblemente con paréntesis como 60(4))
+                qty_token = tokens[2]
+                if not re.match(r'\d+(?:\([^)]*\))?', qty_token):
+                    continue
+                pieces = qty_token
+                name = ' '.join(tokens[3:])
+                # Precio 0 para agotados (se marcarán como no disponible)
+                price = 0.0
+                
+            else:
+                # Formato: $[precio] [opcional: escala] [MODELO] [cantidad] [nombre]
+                if not line.startswith('$'):
+                    continue
+                
+                tokens = line.split()
+                if len(tokens) < 4:
+                    continue
+                
+                # Precio: primer token (quitar $)
+                price_str = tokens[0].replace('$', '').replace(',', '.')
+                try:
+                    price = float(price_str)
+                except:
+                    continue
+                
+                # Buscar el modelo: es el token que parece un modelo (formato: letras+guiones+números)
+                # y NO es escala y NO es cantidad
+                # Escala: "50cajas:$130" o "100cajas:125"
+                model = None
+                pieces = None
+                name_start_idx = None
+                
+                for i, token in enumerate(tokens[1:], start=1):
+                    # Saltar tokens de escala
+                    if re.match(r'\d+cajas:', token, re.IGNORECASE):
+                        continue
+                    # El modelo coincide con patrón: empieza con letra, tiene letras/números/guiones, longitud 2-10
+                    if model is None and re.match(r'^[A-Za-z][A-Za-z0-9\-]{1,10}$', token):
+                        model = token
+                        continue
+                    # La cantidad es el primer número después del modelo
+                    if model is not None and pieces is None:
+                        if re.match(r'\d+(?:\([^)]*\))?', token):
+                            pieces = token
+                            name_start_idx = i + 1
+                            break
+                
+                if model is None or pieces is None:
+                    continue
+                
+                name = ' '.join(tokens[name_start_idx:]) if name_start_idx else ''
+            
+            if model:
                 data.append({
                     'modelo': model.strip(),
-                    'precio_nuevo': float(price.strip()),
+                    'precio_nuevo': price,
                     'piezas_caja': pieces.strip(),
-                    'nombre': name.strip()
+                    'nombre': name.strip()[:50],  # Limitar nombre
+                    'agotado': is_agotado
                 })
         
         return data
@@ -198,18 +259,42 @@ def extract_pdf_data(pdf_file):
         return []
 
 # ==================== ARQUEO ====================
+def normalize_model(model):
+    """Normaliza un modelo para matching flexible: quita guiones, espacios, mayúsculas"""
+    return re.sub(r'[^a-zA-Z0-9]', '', model).upper()
+
 def do_arqueo_fast(pdf_data, bsale_df):
-    """Arqueo optimizado — matching en memoria"""
+    """Arqueo optimizado — matching en memoria con normalización"""
     matches = []
     not_found = []
     
-    # Pre-construir diccionario de modelo → variantes
+    # Pre-construir diccionario de modelo normalizado → variantes
     model_to_variants = {}
     for _, row in bsale_df.iterrows():
         name = row['product_name'].upper()
+        # También crear versión sin guiones del nombre para buscar
+        name_normalized = normalize_model(name)
+        
         for pdf_item in pdf_data:
             model = pdf_item['modelo']
+            model_norm = normalize_model(model)
+            
+            # Intentar match de 3 formas:
+            # 1. Modelo exacto en nombre
+            # 2. Modelo normalizado en nombre normalizado
+            # 3. Modelo sin guiones en nombre sin guiones
+            match_found = False
+            
             if model.upper() in name:
+                match_found = True
+            elif model_norm in name_normalized:
+                match_found = True
+            elif len(model_norm) >= 3:  # Solo buscar substrings si el modelo es largo
+                # Buscar el modelo sin guiones dentro del nombre sin guiones
+                if model_norm in name_normalized:
+                    match_found = True
+            
+            if match_found:
                 if model not in model_to_variants:
                     model_to_variants[model] = []
                 model_to_variants[model].append(row)
@@ -217,6 +302,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
     for pdf_item in pdf_data:
         model = pdf_item['modelo']
         nuevo_precio = pdf_item['precio_nuevo']
+        agotado = pdf_item.get('agotado', False)
         
         if model in model_to_variants:
             for row in model_to_variants[model]:
@@ -229,6 +315,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
                     'variant_id': str(row['variant_id']),
                     'precio_nuevo': nuevo_precio,
                     'costo_viejo': row['costo_promedio'],
+                    'agotado': agotado,
                 })
         else:
             not_found.append({
@@ -236,7 +323,8 @@ def do_arqueo_fast(pdf_data, bsale_df):
                 'precio_nuevo': nuevo_precio,
                 'piezas_caja': pdf_item['piezas_caja'],
                 'nombre': pdf_item['nombre'],
-                'status': '❌ NO ENCONTRADO'
+                'status': '❌ NO ENCONTRADO',
+                'agotado': agotado,
             })
     
     return pd.DataFrame(matches), pd.DataFrame(not_found)
