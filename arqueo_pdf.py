@@ -75,13 +75,18 @@ def fetch_reception_page(offset, limit=50):
     
     all_details = []
     for item in items:
+        reception_date = item.get('receptionDate', '') or item.get('date', '')
         details = item.get('details', {})
         if isinstance(details, dict) and 'items' in details:
-            all_details.extend(details.get('items', []))
+            for d in details.get('items', []):
+                d['reception_date'] = reception_date
+                all_details.append(d)
         elif isinstance(details, dict) and 'href' in details:
             # fallback si expand no funcionó
             d_data = get_json(details['href'])
-            all_details.extend(d_data.get('items', []))
+            for d in d_data.get('items', []):
+                d['reception_date'] = reception_date
+                all_details.append(d)
     
     return all_details, len(items)
 
@@ -201,8 +206,8 @@ def fetch_all_products_fast():
     
     return df
 
-def get_last_reception_costs(needed_variant_ids):
-    """Obtiene el costo de la ÚLTIMA recepción para cada variante — para saber si el stock es viejo o nuevo"""
+def get_reception_history_for_variants(needed_variant_ids):
+    """Obtiene el HISTORIAL COMPLETO de recepciones para cada variante — para calcular FIFO"""
     reception_history = {}
     needed = set(str(v) for v in needed_variant_ids)
     if not needed:
@@ -238,25 +243,60 @@ def get_last_reception_costs(needed_variant_ids):
                 v_id = str(d.get('variant', {}).get('id', ''))
                 cost = d.get('cost', 0)
                 quantity = d.get('quantity', 0)
-                if v_id in needed and cost > 0:
+                reception_date = d.get('reception_date', '') or ''
+                if v_id in needed and cost > 0 and quantity > 0:
                     if v_id not in reception_history:
                         reception_history[v_id] = []
                     reception_history[v_id].append({
                         'cost': cost,
                         'quantity': quantity,
+                        'date': reception_date,
                     })
     
     progress_bar.empty()
     status_text.empty()
+    return reception_history
+
+def calculate_fifo_stock(stock_total, reception_history):
+    """Calcula el desglose de stock por precio usando FIFO (por fecha)"""
+    if not reception_history or stock_total <= 0:
+        return []
     
-    # Devolver el último costo para cada variante (la más reciente es la última en la lista)
-    last_costs = {}
-    for v_id, history in reception_history.items():
-        if history:
-            # La última recepción es la última en la lista
-            last_costs[v_id] = history[-1]['cost']
+    # Ordenar recepciones por fecha (más antigua primero) para FIFO verdadero
+    sorted_receptions = sorted(reception_history, key=lambda x: x.get('date', '') or '9999-99-99')
     
-    return last_costs
+    remaining = stock_total
+    fifo_result = []
+    
+    # Aplicar FIFO: consumir desde las recepciones más antiguas
+    for reception in sorted_receptions:
+        if remaining <= 0:
+            break
+        qty = reception['quantity']
+        cost = reception['cost']
+        if remaining >= qty:
+            # Toda esta recepción se consumió (vendida)
+            remaining -= qty
+        else:
+            # Solo queda parte de esta recepción
+            fifo_result.append({
+                'cost': cost,
+                'quantity': remaining,
+                'date': reception.get('date', ''),
+            })
+            remaining = 0
+    
+    # Si aún queda stock después de consumir todas las recepciones antiguas,
+    # es de la última recepción (la más reciente)
+    if remaining > 0 and sorted_receptions:
+        last_reception = sorted_receptions[-1]
+        fifo_result.append({
+            'cost': last_reception['cost'],
+            'quantity': remaining,
+            'date': last_reception.get('date', ''),
+        })
+    
+    return fifo_result
 
 # ==================== EXTRACCIÓN PDF ====================
 def extract_pdf_data(pdf_file):
@@ -479,38 +519,50 @@ else:
                 with st.spinner("Buscando coincidencias en Bsale..."):
                     matches_df, not_found = do_arqueo_fast(all_pdf_data, st.session_state.bsale_df)
                 
-                # Obtener costos de recepción SOLO para variantes encontradas
+                # Obtener historial completo de recepciones y calcular FIFO
                 if not matches_df.empty and len(matches_df) > 0:
                     # Asegurar que costo_viejo sea float
                     matches_df['costo_viejo'] = matches_df['costo_viejo'].astype(float)
                     matches_df['stock'] = matches_df['stock'].astype(float)
                     
                     variant_ids = matches_df['variant_id'].unique().tolist()
-                    last_reception_costs = get_last_reception_costs(variant_ids)
+                    reception_history = get_reception_history_for_variants(variant_ids)
                     
-                    # Aplicar costos de la última recepción y determinar si stock es viejo o nuevo
+                    # Calcular FIFO para cada variante
                     for idx, row in matches_df.iterrows():
                         v_id = str(row['variant_id'])
                         precio_nuevo = row['precio_nuevo']
+                        stock_total = row['stock']
                         
-                        if v_id in last_reception_costs:
-                            last_cost = last_reception_costs[v_id]
-                            matches_df.loc[idx, 'costo_ultima_recepcion'] = float(last_cost)
-                            # Determinar si el stock es viejo o nuevo
-                            if abs(last_cost - precio_nuevo) < 0.01:  # Considerar igual si la diferencia es menor a 1 centavo
-                                matches_df.loc[idx, 'tipo_stock'] = 'NUEVO'
-                                matches_df.loc[idx, 'stock_viejo'] = 0
-                                matches_df.loc[idx, 'stock_nuevo'] = row['stock']
-                            else:
-                                matches_df.loc[idx, 'tipo_stock'] = 'VIEJO'
-                                matches_df.loc[idx, 'stock_viejo'] = row['stock']
-                                matches_df.loc[idx, 'stock_nuevo'] = 0
+                        if v_id in reception_history and stock_total > 0:
+                            history = reception_history[v_id]
+                            fifo_result = calculate_fifo_stock(stock_total, history)
+                            
+                            # Calcular stock viejo y nuevo basado en FIFO
+                            stock_viejo = 0
+                            stock_nuevo = 0
+                            costo_viejo_promedio = 0
+                            
+                            for lot in fifo_result:
+                                if abs(lot['cost'] - precio_nuevo) < 0.01:
+                                    stock_nuevo += lot['quantity']
+                                else:
+                                    stock_viejo += lot['quantity']
+                            
+                            # Calcular costo promedio del stock viejo
+                            if stock_viejo > 0:
+                                viejo_lots = [lot for lot in fifo_result if abs(lot['cost'] - precio_nuevo) >= 0.01]
+                                if viejo_lots:
+                                    costo_viejo_promedio = sum(lot['cost'] * lot['quantity'] for lot in viejo_lots) / stock_viejo
+                            
+                            matches_df.loc[idx, 'stock_viejo'] = stock_viejo
+                            matches_df.loc[idx, 'stock_nuevo'] = stock_nuevo
+                            matches_df.loc[idx, 'costo_viejo'] = costo_viejo_promedio if costo_viejo_promedio > 0 else row['costo_viejo']
+                            matches_df.loc[idx, 'tipo_stock'] = 'VIEJO' if stock_viejo > 0 else 'NUEVO' if stock_nuevo > 0 else 'SIN RECEPCIÓN'
                         else:
-                            # No hay recepción registrada
-                            matches_df.loc[idx, 'costo_ultima_recepcion'] = 0
-                            matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
-                            matches_df.loc[idx, 'stock_viejo'] = row['stock']
+                            matches_df.loc[idx, 'stock_viejo'] = stock_total
                             matches_df.loc[idx, 'stock_nuevo'] = 0
+                            matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
                     
                     # Calcular valores solo para stock viejo
                     matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
