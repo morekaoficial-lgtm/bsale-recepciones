@@ -355,19 +355,37 @@ else:
     st.markdown('<div class="section-title">📁 Paso 2: Subir PDF de Lista VIP</div>', unsafe_allow_html=True)
     st.success(f"✅ Bsale conectado: **{len(st.session_state.bsale_df)}** variantes cargadas")
     
-    uploaded_file = st.file_uploader("Selecciona el PDF (lista VIP de proveedor)", type=['pdf'])
+    uploaded_files = st.file_uploader("Selecciona los PDFs (lista VIP de proveedor)", type=['pdf'], accept_multiple_files=True)
     
-    if uploaded_file:
-        with st.spinner("Extrayendo datos del PDF..."):
-            pdf_data = extract_pdf_data(io.BytesIO(uploaded_file.read()))
+    if uploaded_files:
+        all_pdf_data = []
+        pdf_stats = []
         
-        if pdf_data:
-            st.success(f"✅ **{len(pdf_data)}** modelos encontrados en el PDF")
-            st.dataframe(pd.DataFrame(pdf_data), use_container_width=True, height=150)
+        for pdf_file in uploaded_files:
+            with st.spinner(f"Extrayendo datos de {pdf_file.name}..."):
+                pdf_data = extract_pdf_data(io.BytesIO(pdf_file.read()))
+                all_pdf_data.extend(pdf_data)
+                pdf_stats.append({
+                    'archivo': pdf_file.name,
+                    'total': len(pdf_data),
+                    'disponibles': sum(1 for d in pdf_data if not d['agotado']),
+                    'agotados': sum(1 for d in pdf_data if d['agotado'])
+                })
+        
+        if all_pdf_data:
+            st.success(f"✅ **{len(all_pdf_data)}** modelos encontrados en total ({len(uploaded_files)} PDFs)")
+            
+            # Mostrar resumen por PDF
+            stats_df = pd.DataFrame(pdf_stats)
+            st.dataframe(stats_df, use_container_width=True, height=150)
+            
+            # Mostrar preview de todos los modelos
+            with st.expander("📋 Ver todos los modelos extraídos"):
+                st.dataframe(pd.DataFrame(all_pdf_data), use_container_width=True, height=300)
             
             if st.button("🚀 ARQUEAR AHORA", type="primary", use_container_width=True):
-                with st.spinner("Buscando coincidencias..."):
-                    matches_df, not_found = do_arqueo_fast(pdf_data, st.session_state.bsale_df)
+                with st.spinner("Buscando coincidencias en Bsale..."):
+                    matches_df, not_found = do_arqueo_fast(all_pdf_data, st.session_state.bsale_df)
                 
                 # Obtener costos de recepción SOLO para variantes encontradas
                 if not matches_df.empty:
