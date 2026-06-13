@@ -85,14 +85,91 @@ def fetch_reception_page(offset, limit=50):
     
     return all_details, len(items)
 
+def fetch_stock_page(offset, limit=50):
+    """Fetch una página de stocks con oficina y variante"""
+    url = f"{BASE_URL}/stocks.json?limit={limit}&offset={offset}&expand=variant,office"
+    data = get_json(url)
+    items = data.get('items', [])
+    
+    results = []
+    for item in items:
+        variant = item.get('variant', {})
+        office = item.get('office', {})
+        quantity = item.get('quantity', 0) or 0
+        qty_available = item.get('quantityAvailable', 0) or 0
+        
+        if variant and quantity > 0:
+            results.append({
+                'variant_id': variant.get('id'),
+                'variant_code': variant.get('code', ''),
+                'variant_desc': variant.get('description', ''),
+                'product_id': variant.get('product', {}).get('id', ''),
+                'office_id': office.get('id', ''),
+                'office_name': office.get('name', ''),
+                'quantity': quantity,
+                'quantityAvailable': qty_available,
+            })
+    
+    return results, len(items)
+
+def get_total_stock_by_variant():
+    """Obtiene stock total de TODAS las oficinas agrupado por variante"""
+    data = get_json(f"{BASE_URL}/stocks.json?limit=1&offset=0")
+    total_count = data.get('count', 0)
+    
+    if total_count == 0:
+        return {}
+    
+    limit = 50
+    offsets = list(range(0, total_count, limit))
+    
+    all_stocks = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_stock_page, off, limit): off for off in offsets}
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        status_text.text(f"Obteniendo stock de {total_count} registros...")
+        
+        completed = 0
+        total = len(offsets)
+        
+        for future in as_completed(futures):
+            results, count = future.result()
+            all_stocks.extend(results)
+            completed += 1
+            progress_bar.progress(min(completed / total, 1.0))
+        
+        progress_bar.empty()
+        status_text.empty()
+    
+    # Agrupar por variant_id sumando quantity
+    stock_by_variant = {}
+    for stock in all_stocks:
+        v_id = stock['variant_id']
+        if v_id not in stock_by_variant:
+            stock_by_variant[v_id] = {
+                'total_quantity': 0,
+                'total_available': 0,
+                'offices': [],
+                'variant_code': stock.get('variant_code', ''),
+                'variant_desc': stock.get('variant_desc', ''),
+            }
+        stock_by_variant[v_id]['total_quantity'] += stock['quantity']
+        stock_by_variant[v_id]['total_available'] += stock['quantityAvailable']
+        stock_by_variant[v_id]['offices'].append(stock['office_name'])
+    
+    return stock_by_variant
+
 def fetch_all_products_fast():
-    """Obtiene todos los productos en paralelo"""
+    """Obtiene todos los productos con stock REAL de todas las oficinas"""
     data = get_json(f"{BASE_URL}/products.json?limit=1&offset=0")
     total_count = data.get('count', 0)
     
     if total_count == 0:
         return pd.DataFrame()
     
+    # Paso 1: Obtener productos y variantes
     limit = 50
     offsets = list(range(0, total_count, limit))
     
@@ -109,8 +186,20 @@ def fetch_all_products_fast():
             all_results.extend(results)
             completed += 1
             progress_bar.progress(min(completed / total, 1.0))
+        
+        progress_bar.empty()
     
-    return pd.DataFrame(all_results)
+    df = pd.DataFrame(all_results)
+    
+    # Paso 2: Obtener stock de todas las oficinas
+    stock_by_variant = get_total_stock_by_variant()
+    
+    # Paso 3: Mergear stock real
+    df['stock'] = df['variant_id'].apply(lambda v: stock_by_variant.get(v, {}).get('total_quantity', 0) if v in stock_by_variant else 0)
+    df['stock_available'] = df['variant_id'].apply(lambda v: stock_by_variant.get(v, {}).get('total_available', 0) if v in stock_by_variant else 0)
+    df['offices'] = df['variant_id'].apply(lambda v: ', '.join(stock_by_variant.get(v, {}).get('offices', [])) if v in stock_by_variant else '')
+    
+    return df
 
 def get_reception_costs_for_variants(needed_variant_ids):
     """Obtiene costos de recepción SOLO para variantes necesarias — ultra rápido"""
