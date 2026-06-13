@@ -201,30 +201,27 @@ def fetch_all_products_fast():
     
     return df
 
-def get_reception_costs_for_variants(needed_variant_ids):
-    """Obtiene costos de recepción SOLO para variantes necesarias — ultra rápido"""
-    costs_map = {}
+def get_last_reception_costs(needed_variant_ids):
+    """Obtiene el costo de la ÚLTIMA recepción para cada variante — para saber si el stock es viejo o nuevo"""
+    reception_history = {}
     needed = set(str(v) for v in needed_variant_ids)
     if not needed:
-        return costs_map
+        return reception_history
     
     # Obtener conteo total de recepciones
     data = get_json(f"{BASE_URL}/stocks/receptions.json?limit=1&offset=0")
     total_count = data.get('count', 0)
     
     if total_count == 0:
-        return costs_map
+        return reception_history
     
     limit = 50
     offsets = list(range(0, total_count, limit))
     
-    found_count = 0
-    total_needed = len(needed)
-    
     # Progreso
     progress_bar = st.progress(0)
     status_text = st.empty()
-    status_text.text(f"Buscando costos en {total_count} recepciones...")
+    status_text.text(f"Obteniendo historial de recepciones...")
     
     with ThreadPoolExecutor(max_workers=RATE_LIMIT) as executor:
         futures = {executor.submit(fetch_reception_page, off, limit): off for off in offsets}
@@ -236,25 +233,30 @@ def get_reception_costs_for_variants(needed_variant_ids):
             details, count = future.result()
             completed += 1
             progress_bar.progress(min(completed / total_pages, 1.0))
-            status_text.text(f"Procesando página {completed}/{total_pages}... ({found_count}/{total_needed} encontrados)")
             
             for d in details:
                 v_id = str(d.get('variant', {}).get('id', ''))
                 cost = d.get('cost', 0)
-                if v_id in needed and cost > 0 and v_id not in costs_map:
-                    costs_map[v_id] = cost
-                    found_count += 1
-            
-            # Early stop: si ya encontramos todos los que necesitamos
-            if found_count >= total_needed:
-                # Cancelar futuros pendientes
-                for f in futures:
-                    f.cancel()
-                break
+                quantity = d.get('quantity', 0)
+                if v_id in needed and cost > 0:
+                    if v_id not in reception_history:
+                        reception_history[v_id] = []
+                    reception_history[v_id].append({
+                        'cost': cost,
+                        'quantity': quantity,
+                    })
     
     progress_bar.empty()
     status_text.empty()
-    return costs_map
+    
+    # Devolver el último costo para cada variante (la más reciente es la última en la lista)
+    last_costs = {}
+    for v_id, history in reception_history.items():
+        if history:
+            # La última recepción es la última en la lista
+            last_costs[v_id] = history[-1]['cost']
+    
+    return last_costs
 
 # ==================== EXTRACCIÓN PDF ====================
 def extract_pdf_data(pdf_file):
@@ -484,33 +486,67 @@ else:
                     matches_df['stock'] = matches_df['stock'].astype(float)
                     
                     variant_ids = matches_df['variant_id'].unique().tolist()
-                    reception_costs = get_reception_costs_for_variants(variant_ids)
+                    last_reception_costs = get_last_reception_costs(variant_ids)
                     
-                    # Aplicar costos de recepción
+                    # Aplicar costos de la última recepción y determinar si stock es viejo o nuevo
                     for idx, row in matches_df.iterrows():
                         v_id = str(row['variant_id'])
-                        if v_id in reception_costs:
-                            matches_df.loc[idx, 'costo_viejo'] = float(reception_costs[v_id])
+                        precio_nuevo = row['precio_nuevo']
+                        
+                        if v_id in last_reception_costs:
+                            last_cost = last_reception_costs[v_id]
+                            matches_df.loc[idx, 'costo_ultima_recepcion'] = float(last_cost)
+                            # Determinar si el stock es viejo o nuevo
+                            if abs(last_cost - precio_nuevo) < 0.01:  # Considerar igual si la diferencia es menor a 1 centavo
+                                matches_df.loc[idx, 'tipo_stock'] = 'NUEVO'
+                                matches_df.loc[idx, 'stock_viejo'] = 0
+                                matches_df.loc[idx, 'stock_nuevo'] = row['stock']
+                            else:
+                                matches_df.loc[idx, 'tipo_stock'] = 'VIEJO'
+                                matches_df.loc[idx, 'stock_viejo'] = row['stock']
+                                matches_df.loc[idx, 'stock_nuevo'] = 0
+                        else:
+                            # No hay recepción registrada
+                            matches_df.loc[idx, 'costo_ultima_recepcion'] = 0
+                            matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
+                            matches_df.loc[idx, 'stock_viejo'] = row['stock']
+                            matches_df.loc[idx, 'stock_nuevo'] = 0
                     
-                    # Calcular
-                    matches_df['valor_viejo'] = matches_df['stock'] * matches_df['costo_viejo']
-                    matches_df['valor_nuevo'] = matches_df['stock'] * matches_df['precio_nuevo']
-                    matches_df['diferencia'] = matches_df['valor_nuevo'] - matches_df['valor_viejo']
-                    matches_df['necesita_ajuste'] = (matches_df['stock'] > 0) & (matches_df['costo_viejo'] > 0) & (matches_df['costo_viejo'] != matches_df['precio_nuevo'])
+                    # Calcular valores solo para stock viejo
+                    matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
+                    matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
+                    matches_df['diferencia'] = matches_df['stock_viejo'] * (matches_df['precio_nuevo'] - matches_df['costo_viejo'])
+                    matches_df['necesita_ajuste'] = (matches_df['stock_viejo'] > 0) & (matches_df['costo_viejo'] > 0)
+                    
+                    # Asegurar que 'offices' existe
+                    if 'offices' not in matches_df.columns:
+                        matches_df['offices'] = ''
                 
                 # --- RESUMEN ---
                 st.markdown('<div class="section-title">📊 Resumen del Arqueo</div>', unsafe_allow_html=True)
                 
-                necesita_ajuste = matches_df[matches_df['necesita_ajuste'] == True] if not matches_df.empty else pd.DataFrame()
-                ya_actualizado = matches_df[(matches_df['stock'] > 0) & (~matches_df['necesita_ajuste'])] if not matches_df.empty else pd.DataFrame()
-                sin_stock = matches_df[matches_df['stock'] == 0] if not matches_df.empty else pd.DataFrame()
-                total_diferencia = necesita_ajuste['diferencia'].sum() if not necesita_ajuste.empty else 0
+                # Clasificar por tipo de stock
+                stock_viejo_df = matches_df[matches_df['tipo_stock'] == 'VIEJO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
+                stock_nuevo_df = matches_df[matches_df['tipo_stock'] == 'NUEVO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
+                sin_recepcion_df = matches_df[matches_df['tipo_stock'] == 'SIN RECEPCIÓN'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
+                sin_stock_df = matches_df[matches_df['stock'] == 0] if not matches_df.empty else pd.DataFrame()
+                
+                total_stock_viejo = stock_viejo_df['stock_viejo'].sum() if not stock_viejo_df.empty else 0
+                total_stock_nuevo = stock_nuevo_df['stock_nuevo'].sum() if not stock_nuevo_df.empty else 0
+                total_diferencia = stock_viejo_df['diferencia'].sum() if not stock_viejo_df.empty else 0
                 
                 m1, m2, m3, m4 = st.columns(4)
-                m1.markdown(f'<div class="metric-card metric-card-red"><div class="metric-value">{len(necesita_ajuste)}</div><div class="metric-label">🔴 Necesitan Ajuste</div></div>', unsafe_allow_html=True)
-                m2.markdown(f'<div class="metric-card metric-card-green"><div class="metric-value">{len(ya_actualizado)}</div><div class="metric-label">🟢 Ya Actualizados</div></div>', unsafe_allow_html=True)
-                m3.markdown(f'<div class="metric-card metric-card-gray"><div class="metric-value">{len(sin_stock)}</div><div class="metric-label">⚪ Sin Stock</div></div>', unsafe_allow_html=True)
+                m1.markdown(f'<div class="metric-card metric-card-red"><div class="metric-value">{len(stock_viejo_df)}</div><div class="metric-label">🔴 Stock Precio Viejo</div></div>', unsafe_allow_html=True)
+                m2.markdown(f'<div class="metric-card metric-card-green"><div class="metric-value">{len(stock_nuevo_df)}</div><div class="metric-label">🟢 Stock Precio Nuevo</div></div>', unsafe_allow_html=True)
+                m3.markdown(f'<div class="metric-card metric-card-gray"><div class="metric-value">{len(sin_stock_df)}</div><div class="metric-label">⚪ Sin Stock</div></div>', unsafe_allow_html=True)
                 m4.markdown(f'<div class="metric-card metric-card-orange"><div class="metric-value">${total_diferencia:,.2f}</div><div class="metric-label">💰 Diferencia Total</div></div>', unsafe_allow_html=True)
+                
+                # Métricas adicionales de cantidades
+                st.markdown('<div class="section-title">📦 Cantidades de Stock</div>', unsafe_allow_html=True)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Stock con Precio Viejo", f"{total_stock_viejo:,.0f} unidades")
+                c2.metric("Stock con Precio Nuevo", f"{total_stock_nuevo:,.0f} unidades")
+                c3.metric("Total Stock", f"{total_stock_viejo + total_stock_nuevo:,.0f} unidades")
                 
                 # --- NO ENCONTRADOS ---
                 if not not_found.empty:
@@ -521,47 +557,53 @@ else:
                     st.dataframe(nf[['modelo_pdf', 'nombre', 'precio_nuevo', 'piezas_caja']], use_container_width=True, height=180)
                 
                 # --- TABS ---
-                st.markdown('<div class="section-title">📋 Detalle</div>', unsafe_allow_html=True)
-                tab1, tab2, tab3 = st.tabs(["🔴 Necesitan Ajuste", "🟢 Ya Actualizados", "⚪ Sin Stock"])
+                st.markdown('<div class="section-title">📋 Detalle por Tipo de Stock</div>', unsafe_allow_html=True)
+                tab1, tab2, tab3, tab4 = st.tabs(["🔴 Stock Precio Viejo", "🟢 Stock Precio Nuevo", "⚪ Sin Stock", "❓ Sin Recepción"])
                 
                 with tab1:
-                    if not necesita_ajuste.empty:
-                        st.markdown(f'<div class="highlight-box"><strong>{len(necesita_ajuste)}</strong> necesitan nota de crédito</div>', unsafe_allow_html=True)
-                        d = necesita_ajuste.copy()
+                    if not stock_viejo_df.empty:
+                        st.markdown(f'<div class="highlight-box"><strong>{len(stock_viejo_df)}</strong> productos con stock a precio viejo</div>', unsafe_allow_html=True)
+                        d = stock_viejo_df.copy()
                         d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
                         d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
+                        d['costo_ultima_recepcion'] = d['costo_ultima_recepcion'].apply(lambda x: f"${x:,.2f}")
                         d['valor_viejo'] = d['valor_viejo'].apply(lambda x: f"${x:,.2f}")
-                        d['valor_nuevo'] = d['valor_nuevo'].apply(lambda x: f"${x:,.2f}")
                         d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'valor_nuevo', 'diferencia']], use_container_width=True, height=350)
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'offices', 'costo_ultima_recepcion', 'precio_nuevo', 'valor_viejo', 'diferencia']], use_container_width=True, height=350)
                         
-                        total_v = necesita_ajuste['valor_viejo'].sum()
-                        total_n = necesita_ajuste['valor_nuevo'].sum()
-                        ajuste = total_n - total_v
-                        st.markdown('<div class="section-title">📝 Nota de Crédito</div>', unsafe_allow_html=True)
+                        total_v = stock_viejo_df['valor_viejo'].sum()
+                        total_d = stock_viejo_df['diferencia'].sum()
+                        st.markdown('<div class="section-title">📝 Nota de Crédito (Stock Viejo)</div>', unsafe_allow_html=True)
                         c1, c2, c3 = st.columns(3)
                         c1.metric("Valor Viejo", f"${total_v:,.2f}")
-                        c2.metric("Valor Nuevo", f"${total_n:,.2f}")
-                        c3.metric("Ajuste", f"${ajuste:,.2f}")
+                        c2.metric("Diferencia a Ajustar", f"${total_d:,.2f}")
+                        c3.metric("Unidades", f"{total_stock_viejo:,.0f}")
                     else:
-                        st.success("✅ Ninguno necesita ajuste.")
+                        st.success("✅ Ningún stock con precio viejo.")
                 
                 with tab2:
-                    if not ya_actualizado.empty:
-                        st.info(f"ℹ️ **{len(ya_actualizado)}** ya actualizados")
-                        d = ya_actualizado.copy()
-                        d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
+                    if not stock_nuevo_df.empty:
+                        st.info(f"ℹ️ **{len(stock_nuevo_df)}** productos ya con precio nuevo")
+                        d = stock_nuevo_df.copy()
+                        d['costo_ultima_recepcion'] = d['costo_ultima_recepcion'].apply(lambda x: f"${x:,.2f}")
                         d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices', 'costo_viejo', 'precio_nuevo']], use_container_width=True, height=250)
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'costo_ultima_recepcion', 'precio_nuevo']], use_container_width=True, height=250)
+                    else:
+                        st.info("No hay stock con precio nuevo.")
+                
+                with tab3:
+                    if not sin_stock_df.empty:
+                        st.info(f"ℹ️ **{len(sin_stock_df)}** sin stock")
+                        st.dataframe(sin_stock_df[['modelo_pdf', 'producto_bsale', 'variante', 'offices']], use_container_width=True, height=180)
                     else:
                         st.info("No hay.")
                 
-                with tab3:
-                    if not sin_stock.empty:
-                        st.info(f"ℹ️ **{len(sin_stock)}** sin stock")
-                        st.dataframe(sin_stock[['modelo_pdf', 'producto_bsale', 'variante', 'offices']], use_container_width=True, height=180)
+                with tab4:
+                    if not sin_recepcion_df.empty:
+                        st.warning(f"⚠️ **{len(sin_recepcion_df)}** productos sin historial de recepción")
+                        st.dataframe(sin_recepcion_df[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices']], use_container_width=True, height=180)
                     else:
-                        st.info("No hay.")
+                        st.info("Todos los productos tienen historial de recepción.")
                 
                 # --- DESCARGA UNIFICADA ---
                 # Preparar DataFrame unificado: encontrados + no encontrados
