@@ -519,14 +519,20 @@ else:
                 with st.spinner("Buscando coincidencias en Bsale..."):
                     matches_df, not_found = do_arqueo_fast(all_pdf_data, st.session_state.bsale_df)
                 
-                # Obtener historial completo de recepciones y calcular FIFO
-                if not matches_df.empty and len(matches_df) > 0:
+                st.info(f"📊 Encontrados: {len(matches_df)} matches | {len(not_found)} no encontrados")
+                
+                if matches_df.empty or len(matches_df) == 0:
+                    st.warning("⚠️ No se encontraron coincidencias entre el PDF y Bsale. Verifica los modelos.")
+                else:
+                    # Obtener historial completo de recepciones y calcular FIFO
                     # Asegurar que costo_viejo sea float
                     matches_df['costo_viejo'] = matches_df['costo_viejo'].astype(float)
                     matches_df['stock'] = matches_df['stock'].astype(float)
                     
                     variant_ids = matches_df['variant_id'].unique().tolist()
+                    st.write(f"🔍 Buscando historial de recepciones para {len(variant_ids)} variantes...")
                     reception_history = get_reception_history_for_variants(variant_ids)
+                    st.write(f"✅ Historial obtenido: {len(reception_history)} variantes con recepciones")
                     
                     # Calcular FIFO para cada variante
                     for idx, row in matches_df.iterrows():
@@ -573,6 +579,8 @@ else:
                     # Asegurar que 'offices' existe
                     if 'offices' not in matches_df.columns:
                         matches_df['offices'] = ''
+                    
+                    st.write(f"✅ Procesamiento completado. Mostrando resultados...")
                 
                 # --- RESUMEN ---
                 st.markdown('<div class="section-title">📊 Resumen del Arqueo</div>', unsafe_allow_html=True)
