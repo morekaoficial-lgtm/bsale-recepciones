@@ -626,10 +626,9 @@ else:
                         d = stock_viejo_df.copy()
                         d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
                         d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                        d['costo_ultima_recepcion'] = d['costo_ultima_recepcion'].apply(lambda x: f"${x:,.2f}")
                         d['valor_viejo'] = d['valor_viejo'].apply(lambda x: f"${x:,.2f}")
                         d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'offices', 'costo_ultima_recepcion', 'precio_nuevo', 'valor_viejo', 'diferencia']], use_container_width=True, height=350)
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'offices', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'diferencia']], use_container_width=True, height=350)
                         
                         total_v = stock_viejo_df['valor_viejo'].sum()
                         total_d = stock_viejo_df['diferencia'].sum()
@@ -645,9 +644,11 @@ else:
                     if not stock_nuevo_df.empty:
                         st.info(f"ℹ️ **{len(stock_nuevo_df)}** productos ya con precio nuevo")
                         d = stock_nuevo_df.copy()
-                        d['costo_ultima_recepcion'] = d['costo_ultima_recepcion'].apply(lambda x: f"${x:,.2f}")
                         d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'costo_ultima_recepcion', 'precio_nuevo']], use_container_width=True, height=250)
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'precio_nuevo']], use_container_width=True, height=250)
+                    else:
+                        st.info("No hay stock con precio nuevo.")
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'precio_nuevo']], use_container_width=True, height=250)
                     else:
                         st.info("No hay stock con precio nuevo.")
                 
