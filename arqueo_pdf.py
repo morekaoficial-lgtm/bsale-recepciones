@@ -648,9 +648,6 @@ else:
                         st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'precio_nuevo']], use_container_width=True, height=250)
                     else:
                         st.info("No hay stock con precio nuevo.")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'precio_nuevo']], use_container_width=True, height=250)
-                    else:
-                        st.info("No hay stock con precio nuevo.")
                 
                 with tab3:
                     if not sin_stock_df.empty:
