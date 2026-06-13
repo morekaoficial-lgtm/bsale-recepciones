@@ -388,7 +388,11 @@ else:
                     matches_df, not_found = do_arqueo_fast(all_pdf_data, st.session_state.bsale_df)
                 
                 # Obtener costos de recepción SOLO para variantes encontradas
-                if not matches_df.empty:
+                if not matches_df.empty and len(matches_df) > 0:
+                    # Asegurar que costo_viejo sea float
+                    matches_df['costo_viejo'] = matches_df['costo_viejo'].astype(float)
+                    matches_df['stock'] = matches_df['stock'].astype(float)
+                    
                     variant_ids = matches_df['variant_id'].unique().tolist()
                     reception_costs = get_reception_costs_for_variants(variant_ids)
                     
@@ -396,7 +400,7 @@ else:
                     for idx, row in matches_df.iterrows():
                         v_id = str(row['variant_id'])
                         if v_id in reception_costs:
-                            matches_df.at[idx, 'costo_viejo'] = reception_costs[v_id]
+                            matches_df.loc[idx, 'costo_viejo'] = float(reception_costs[v_id])
                     
                     # Calcular
                     matches_df['valor_viejo'] = matches_df['stock'] * matches_df['costo_viejo']
