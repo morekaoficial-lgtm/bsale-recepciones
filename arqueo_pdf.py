@@ -401,6 +401,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
                     'variante': row['variant_desc'],
                     'codigo': row['variant_code'],
                     'stock': row['stock'],
+                    'offices': row.get('offices', ''),
                     'variant_id': str(row['variant_id']),
                     'precio_nuevo': nuevo_precio,
                     'costo_viejo': row['costo_promedio'],
