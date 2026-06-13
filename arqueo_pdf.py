@@ -532,7 +532,7 @@ else:
                         d['valor_viejo'] = d['valor_viejo'].apply(lambda x: f"${x:,.2f}")
                         d['valor_nuevo'] = d['valor_nuevo'].apply(lambda x: f"${x:,.2f}")
                         d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'valor_nuevo', 'diferencia']], use_container_width=True, height=350)
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'valor_nuevo', 'diferencia']], use_container_width=True, height=350)
                         
                         total_v = necesita_ajuste['valor_viejo'].sum()
                         total_n = necesita_ajuste['valor_nuevo'].sum()
@@ -551,14 +551,14 @@ else:
                         d = ya_actualizado.copy()
                         d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
                         d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'costo_viejo', 'precio_nuevo']], use_container_width=True, height=250)
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices', 'costo_viejo', 'precio_nuevo']], use_container_width=True, height=250)
                     else:
                         st.info("No hay.")
                 
                 with tab3:
                     if not sin_stock.empty:
                         st.info(f"ℹ️ **{len(sin_stock)}** sin stock")
-                        st.dataframe(sin_stock[['modelo_pdf', 'producto_bsale', 'variante']], use_container_width=True, height=180)
+                        st.dataframe(sin_stock[['modelo_pdf', 'producto_bsale', 'variante', 'offices']], use_container_width=True, height=180)
                     else:
                         st.info("No hay.")
                 
