@@ -8,6 +8,52 @@ import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ==================== UTILIDADES DE FECHA ====================
+def parse_bsale_date(fecha_raw):
+    """Convierte cualquier fecha de Bsale a datetime object.
+    Soporta: ISO 8601, timestamp Unix (int/str), YYYY-MM-DD, etc."""
+    if not fecha_raw:
+        return None
+    # Si ya es datetime
+    if isinstance(fecha_raw, datetime):
+        return fecha_raw
+    # Si es número (timestamp Unix)
+    if isinstance(fecha_raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(fecha_raw)
+        except:
+            return None
+    # Convertir a string
+    fecha_str = str(fecha_raw).strip()
+    if not fecha_str:
+        return None
+    # Formato ISO 8601 con T: 2026-03-15T14:30:00 o 2026-03-15T14:30:00.000Z
+    if 'T' in fecha_str:
+        try:
+            # Quitar Z y milisegundos
+            f = fecha_str.replace('Z', '+00:00')
+            if '.' in f:
+                f = f.split('.')[0]
+            if '+' in f and f.index('+') > 10:
+                f = f.split('+')[0]
+            if '-' in f and f.index('-') > 10:
+                f = f.split('-')[0]
+            return datetime.strptime(f, '%Y-%m-%dT%H:%M:%S')
+        except:
+            pass
+    # Formato YYYY-MM-DD
+    try:
+        return datetime.strptime(fecha_str, '%Y-%m-%d')
+    except:
+        pass
+    # Timestamp Unix como string
+    if fecha_str.isdigit():
+        try:
+            return datetime.fromtimestamp(int(fecha_str))
+        except:
+            pass
+    return None
+
 st.set_page_config(page_title="Bsale - Arqueo de Precios (PDF)", page_icon="📊", layout="wide")
 
 # ==================== PERSISTENCIA ====================
@@ -673,8 +719,17 @@ with tab_arqueo:
                         reception_history = get_reception_history_for_variants(variant_ids)
                         st.write(f"✅ Historial obtenido: {len(reception_history)} variantes con recepciones")
                         
-                        fecha_ref_str = fecha_ref.strftime('%Y-%m-%d') if fecha_ref else None
+                        fecha_ref_dt = datetime.combine(fecha_ref, datetime.min.time()) if fecha_ref else None
                         productos_con_recepcion_post = 0
+                        
+                        # DEBUG: mostrar formatos de fecha detectados
+                        if usar_filtro_fecha and fecha_ref_dt:
+                            all_sample_dates = set()
+                            for h in reception_history.values():
+                                for r in h[:3]:
+                                    all_sample_dates.add(str(r.get('date', 'N/A')))
+                            st.write(f"📅 **Formatos de fecha detectados en Bsale:** {', '.join(sorted(all_sample_dates)[:5])}")
+                            st.write(f"📅 **Fecha de referencia:** {fecha_ref_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                         
                         for idx, row in matches_df.iterrows():
                             v_id = str(row['variant_id'])
@@ -684,9 +739,14 @@ with tab_arqueo:
                             if v_id in reception_history and stock_total > 0:
                                 history = reception_history[v_id]
                                 
-                                if usar_filtro_fecha and fecha_ref_str:
+                                if usar_filtro_fecha and fecha_ref_dt:
                                     # Verificar si hay recepciones DESPUÉS de la fecha de referencia
-                                    recepciones_post = [r for r in history if r.get('date', '') > fecha_ref_str]
+                                    # Usar parse_bsale_date para soportar cualquier formato
+                                    recepciones_post = []
+                                    for r in history:
+                                        r_date = parse_bsale_date(r.get('date', ''))
+                                        if r_date and r_date > fecha_ref_dt:
+                                            recepciones_post.append(r)
                                     
                                     if not recepciones_post:
                                         # No hay recepciones después de la fecha, marcar como filtrado
@@ -694,12 +754,16 @@ with tab_arqueo:
                                         matches_df.loc[idx, 'stock_nuevo'] = 0
                                         matches_df.loc[idx, 'tipo_stock'] = 'FILTRADO_POR_FECHA'
                                         matches_df.loc[idx, 'recepcion_post'] = False
-                                        matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in history) if history else ''
+                                        last_dates = [parse_bsale_date(r.get('date', '')) for r in history]
+                                        last_valid = max([d for d in last_dates if d], default=None)
+                                        matches_df.loc[idx, 'ultima_recepcion'] = last_valid.strftime('%Y-%m-%d') if last_valid else ''
                                         continue
                                     else:
                                         productos_con_recepcion_post += 1
                                         matches_df.loc[idx, 'recepcion_post'] = True
-                                        matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in recepciones_post)
+                                        post_dates = [parse_bsale_date(r.get('date', '')) for r in recepciones_post]
+                                        last_post = max([d for d in post_dates if d], default=None)
+                                        matches_df.loc[idx, 'ultima_recepcion'] = last_post.strftime('%Y-%m-%d') if last_post else ''
                                 
                                 # Calcular FIFO para el stock actual
                                 fifo_result = calculate_fifo_stock(stock_total, history)
