@@ -587,7 +587,7 @@ if 'bsale_df' not in st.session_state:
 if 'step' not in st.session_state:
     st.session_state.step = 1
 
-tab_arqueo, tab_historial, tab_notas, tab_fecha = st.tabs(["📊 Arqueo", "📋 Historial", "💳 Notas de Crédito", "🔍 Arqueo por Fecha"])
+tab_arqueo, tab_historial, tab_notas = st.tabs(["📊 Arqueo", "📋 Historial", "💳 Notas de Crédito"])
 
 # ============================================================
 # TAB 1: ARQUEO (contenido original)
@@ -633,7 +633,30 @@ with tab_arqueo:
                 with st.expander("📋 Ver todos los modelos extraídos"):
                     st.dataframe(pd.DataFrame(all_pdf_data), use_container_width=True, height=300)
                 
-                if st.button("🚀 ARQUEAR AHORA", type="primary", use_container_width=True):
+                # --- FILTRO POR FECHA (integrado en Arqueo) ---
+                notas = load_notas_credito()
+                arqueos_con_nc = set(n['arqueo_id'] for n in notas)
+                fechas_nc = {n['arqueo_id']: n['fecha_pago'] for n in notas}
+                
+                usar_filtro_fecha = st.checkbox("🔍 Filtrar por fecha de recepción (solo productos con recepciones después de una fecha)", value=False)
+                
+                fecha_ref = None
+                if usar_filtro_fecha:
+                    st.markdown("""
+                    <div class="highlight-box">
+                    Este filtro calcula <b>solo para productos que recibieron stock después de la fecha de referencia</b>.
+                    Útil cuando ya pagaste una nota de crédito y quieres calcular solo las nuevas recepciones.
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if arqueos_con_nc:
+                        st.info(f"💳 **{len(arqueos_con_nc)}** arqueos con nota de crédito pagada. Fechas registradas: " + ", ".join([f"{aid} ({fechas_nc.get(aid, 'N/A')})" for aid in list(arqueos_con_nc)[:5]]))
+                    
+                    fecha_ref = st.date_input("📅 Fecha de referencia (solo recepciones después de esta fecha)", value=date.today())
+                
+                btn_text = "🚀 ARQUEAR POR FECHA" if usar_filtro_fecha else "🚀 ARQUEAR AHORA"
+                
+                if st.button(btn_text, type="primary", use_container_width=True):
                     with st.spinner("Buscando coincidencias en Bsale..."):
                         matches_df, not_found = do_arqueo_fast(all_pdf_data, st.session_state.bsale_df)
                     
@@ -650,6 +673,9 @@ with tab_arqueo:
                         reception_history = get_reception_history_for_variants(variant_ids)
                         st.write(f"✅ Historial obtenido: {len(reception_history)} variantes con recepciones")
                         
+                        fecha_ref_str = fecha_ref.strftime('%Y-%m-%d') if fecha_ref else None
+                        productos_con_recepcion_post = 0
+                        
                         for idx, row in matches_df.iterrows():
                             v_id = str(row['variant_id'])
                             precio_nuevo = row['precio_nuevo']
@@ -657,6 +683,25 @@ with tab_arqueo:
                             
                             if v_id in reception_history and stock_total > 0:
                                 history = reception_history[v_id]
+                                
+                                if usar_filtro_fecha and fecha_ref_str:
+                                    # Verificar si hay recepciones DESPUÉS de la fecha de referencia
+                                    recepciones_post = [r for r in history if r.get('date', '') > fecha_ref_str]
+                                    
+                                    if not recepciones_post:
+                                        # No hay recepciones después de la fecha, marcar como filtrado
+                                        matches_df.loc[idx, 'stock_viejo'] = 0
+                                        matches_df.loc[idx, 'stock_nuevo'] = 0
+                                        matches_df.loc[idx, 'tipo_stock'] = 'FILTRADO_POR_FECHA'
+                                        matches_df.loc[idx, 'recepcion_post'] = False
+                                        matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in history) if history else ''
+                                        continue
+                                    else:
+                                        productos_con_recepcion_post += 1
+                                        matches_df.loc[idx, 'recepcion_post'] = True
+                                        matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in recepciones_post)
+                                
+                                # Calcular FIFO para el stock actual
                                 fifo_result = calculate_fifo_stock(stock_total, history)
                                 
                                 stock_viejo = 0
@@ -682,6 +727,18 @@ with tab_arqueo:
                                 matches_df.loc[idx, 'stock_viejo'] = stock_total
                                 matches_df.loc[idx, 'stock_nuevo'] = 0
                                 matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
+                                if usar_filtro_fecha:
+                                    matches_df.loc[idx, 'recepcion_post'] = False
+                                    matches_df.loc[idx, 'ultima_recepcion'] = ''
+                        
+                        # Si filtro por fecha está activo, filtrar solo productos con recepción posterior
+                        if usar_filtro_fecha and fecha_ref_str:
+                            matches_df = matches_df[matches_df.get('recepcion_post', pd.Series([False]*len(matches_df))) == True].copy()
+                            if matches_df.empty:
+                                st.warning("⚠️ Ninguno de los productos encontrados tiene recepciones después de la fecha de referencia.")
+                                st.stop()
+                            else:
+                                st.success(f"✅ **{len(matches_df)}** productos con recepciones después de {fecha_ref_str}")
                         
                         matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
                         matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
@@ -954,184 +1011,6 @@ with tab_notas:
                     </div>
                     """, unsafe_allow_html=True)
 
-# ============================================================
-# TAB 4: ARQUEO POR FECHA
-# ============================================================
-with tab_fecha:
-    st.markdown('<div class="section-title">🔍 Arqueo por Fecha de Referencia</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div class="highlight-box">
-    Este modo calcula la diferencia de precios <b>solo para productos que recibieron stock después de la fecha de referencia</b>.
-    Útil cuando ya pagaste una nota de crédito y quieres calcular solo las nuevas recepciones.
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Seleccionar arqueo base (que ya tiene nota de crédito)
-    arqueos = load_arqueos_index()
-    notas = load_notas_credito()
-    arqueos_con_nc = set(n['arqueo_id'] for n in notas)
-    
-    if not arqueos_con_nc:
-        st.warning("⚠️ No hay arqueos con nota de crédito. Primero registra un pago en la pestaña 💳 Notas de Crédito.")
-    else:
-        arqueos_base = [a for a in arqueos if a['id'] in arqueos_con_nc]
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            opciones = {f"{a['id']} — {a['fecha']}": a['id'] for a in arqueos_base}
-            seleccion = st.selectbox("Arqueo con Nota de Crédito (referencia)", list(opciones.keys()))
-            arqueo_ref_id = opciones[seleccion]
-            
-            # Obtener fecha de la nota de crédito
-            ultima_fecha_nc = get_ultima_fecha_nota_credito(arqueo_ref_id)
-            if ultima_fecha_nc:
-                st.success(f"💳 Última NC: **{ultima_fecha_nc}**")
-                fecha_ref = st.date_input("Fecha de referencia", value=datetime.strptime(ultima_fecha_nc, '%Y-%m-%d').date())
-            else:
-                fecha_ref = st.date_input("Fecha de referencia", value=date.today())
-        
-        with col2:
-            st.subheader("📁 PDF de Precios Nuevos")
-            uploaded_file_fecha = st.file_uploader("Subir PDF de lista VIP", type=['pdf'], key="fecha_pdf")
-        
-        if uploaded_file_fecha and fecha_ref:
-            with st.spinner("Extrayendo datos del PDF..."):
-                pdf_data_fecha = extract_pdf_data(io.BytesIO(uploaded_file_fecha.read()))
-            
-            st.success(f"✅ **{len(pdf_data_fecha)}** modelos extraídos")
-            
-            if st.button("🚀 ARQUEAR POR FECHA", type="primary", use_container_width=True):
-                if st.session_state.bsale_df is None or st.session_state.bsale_df.empty:
-                    st.error("❌ Primero carga el inventario Bsale en la pestaña 📊 Arqueo > Paso 1.")
-                else:
-                    with st.spinner("Buscando en Bsale y filtrando por fecha de recepción..."):
-                        matches_df, not_found = do_arqueo_fast(pdf_data_fecha, st.session_state.bsale_df)
-                    
-                    if matches_df.empty:
-                        st.warning("⚠️ No se encontraron coincidencias.")
-                    else:
-                        matches_df['costo_viejo'] = matches_df['costo_viejo'].astype(float)
-                        matches_df['stock'] = matches_df['stock'].astype(float)
-                        
-                        variant_ids = matches_df['variant_id'].unique().tolist()
-                        st.write(f"🔍 Buscando historial de recepciones para {len(variant_ids)} variantes...")
-                        reception_history = get_reception_history_for_variants(variant_ids)
-                        st.write(f"✅ Historial obtenido: {len(reception_history)} variantes con recepciones")
-                        
-                        fecha_ref_str = fecha_ref.strftime('%Y-%m-%d')
-                        productos_con_recepcion_post = 0
-                        
-                        for idx, row in matches_df.iterrows():
-                            v_id = str(row['variant_id'])
-                            precio_nuevo = row['precio_nuevo']
-                            stock_total = row['stock']
-                            
-                            if v_id in reception_history and stock_total > 0:
-                                history = reception_history[v_id]
-                                
-                                # Verificar si hay recepciones DESPUÉS de la fecha de referencia
-                                recepciones_post = [r for r in history if r.get('date', '') > fecha_ref_str]
-                                
-                                if recepciones_post:
-                                    productos_con_recepcion_post += 1
-                                    # Calcular FIFO para el stock actual
-                                    fifo_result = calculate_fifo_stock(stock_total, history)
-                                    
-                                    stock_viejo = 0
-                                    stock_nuevo = 0
-                                    costo_viejo_promedio = 0
-                                    
-                                    for lot in fifo_result:
-                                        if abs(lot['cost'] - precio_nuevo) < 0.01:
-                                            stock_nuevo += lot['quantity']
-                                        else:
-                                            stock_viejo += lot['quantity']
-                                    
-                                    if stock_viejo > 0:
-                                        viejo_lots = [lot for lot in fifo_result if abs(lot['cost'] - precio_nuevo) >= 0.01]
-                                        if viejo_lots:
-                                            costo_viejo_promedio = sum(lot['cost'] * lot['quantity'] for lot in viejo_lots) / stock_viejo
-                                    
-                                    matches_df.loc[idx, 'stock_viejo'] = stock_viejo
-                                    matches_df.loc[idx, 'stock_nuevo'] = stock_nuevo
-                                    matches_df.loc[idx, 'costo_viejo'] = costo_viejo_promedio if costo_viejo_promedio > 0 else row['costo_viejo']
-                                    matches_df.loc[idx, 'tipo_stock'] = 'VIEJO' if stock_viejo > 0 else 'NUEVO' if stock_nuevo > 0 else 'SIN RECEPCIÓN'
-                                    matches_df.loc[idx, 'recepcion_post'] = True
-                                    matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in recepciones_post)
-                                else:
-                                    matches_df.loc[idx, 'stock_viejo'] = 0
-                                    matches_df.loc[idx, 'stock_nuevo'] = 0
-                                    matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCION_POST'
-                                    matches_df.loc[idx, 'recepcion_post'] = False
-                                    matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in history) if history else ''
-                            else:
-                                matches_df.loc[idx, 'stock_viejo'] = stock_total
-                                matches_df.loc[idx, 'stock_nuevo'] = 0
-                                matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
-                                matches_df.loc[idx, 'recepcion_post'] = False
-                                matches_df.loc[idx, 'ultima_recepcion'] = ''
-                        
-                        # Filtrar solo productos con recepción posterior
-                        matches_df = matches_df[matches_df['recepcion_post'] == True].copy() if 'recepcion_post' in matches_df.columns else pd.DataFrame()
-                        
-                        if matches_df.empty:
-                            st.warning("⚠️ Ninguno de los productos encontrados tiene recepciones después de la fecha de referencia.")
-                        else:
-                            st.success(f"✅ **{len(matches_df)}** productos con recepciones después de {fecha_ref_str}")
-                            
-                            matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
-                            matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
-                            
-                            matches_df['diferencia'] = 0.0
-                            mask_valid = (matches_df['precio_nuevo'] > 0) & (matches_df['costo_viejo'] > 0)
-                            matches_df.loc[mask_valid, 'diferencia'] = (
-                                matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'precio_nuevo']
-                            ) - (
-                                matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'costo_viejo']
-                            )
-                            
-                            matches_df['subida'] = 0.0
-                            mask_subida = mask_valid & (matches_df['precio_nuevo'] > matches_df['costo_viejo'])
-                            matches_df.loc[mask_subida, 'subida'] = matches_df.loc[mask_subida, 'diferencia']
-                            
-                            matches_df['bajada'] = 0.0
-                            mask_bajada = mask_valid & (matches_df['precio_nuevo'] < matches_df['costo_viejo'])
-                            matches_df.loc[mask_bajada, 'bajada'] = matches_df.loc[mask_bajada, 'diferencia']
-                            
-                            if 'offices' not in matches_df.columns:
-                                matches_df['offices'] = ''
-                            
-                            # --- RESUMEN ---
-                            st.markdown('<div class="section-title">📊 Resumen del Arqueo por Fecha</div>', unsafe_allow_html=True)
-                            
-                            stock_viejo_df = matches_df[matches_df['tipo_stock'] == 'VIEJO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
-                            total_diferencia = stock_viejo_df['diferencia'].sum() if not stock_viejo_df.empty else 0
-                            total_stock_viejo = stock_viejo_df['stock_viejo'].sum() if not stock_viejo_df.empty else 0
-                            
-                            m1, m2, m3 = st.columns(3)
-                            m1.metric("Productos con Recepción Posterior", len(matches_df))
-                            m2.metric("Stock Precio Viejo", f"{total_stock_viejo:,.0f} unidades")
-                            m3.metric("Diferencia Total", f"${total_diferencia:,.2f}")
-                            
-                            # Mostrar detalle
-                            if not stock_viejo_df.empty:
-                                st.markdown('<div class="section-title">🔴 Detalle — Stock con Precio Viejo (Recepciones Posteriores)</div>', unsafe_allow_html=True)
-                                d = stock_viejo_df.copy()
-                                d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
-                                d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                                d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
-                                d['ultima_recepcion'] = d['ultima_recepcion'].fillna('')
-                                st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'ultima_recepcion', 'costo_viejo', 'precio_nuevo', 'diferencia']], use_container_width=True, height=350)
-                            
-                            # Descarga
-                            if not matches_df.empty:
-                                st.download_button(
-                                    "⬇️ Descargar Arqueo por Fecha (CSV)",
-                                    matches_df.to_csv(index=False).encode('utf-8'),
-                                    f"arqueo_fecha_{fecha_ref.strftime('%Y%m%d')}_{datetime.now().strftime('%H%M')}.csv",
-                                    "text/csv",
-                                    use_container_width=True
-                                )
+
 
 st.markdown("""<div style="text-align: center; color: #888; margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #e9ecef;">Bsale Arqueo PDF | Ultra-rápido</div>""", unsafe_allow_html=True)
