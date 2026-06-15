@@ -300,91 +300,97 @@ def calculate_fifo_stock(stock_total, reception_history):
 
 # ==================== EXTRACCIÓN PDF ====================
 def extract_pdf_data(pdf_file):
-    """Extrae modelo y precio del PDF de lista VIP — soporta múltiples formatos"""
+    """Extrae modelo y precio del PDF de lista VIP usando tablas (extract_tables)"""
     try:
         import pdfplumber
         with pdfplumber.open(pdf_file) as pdf:
-            text = ""
+            data = []
             for page in pdf.pages:
-                text += page.extract_text() + "\n"
-        
-        data = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
+                tables = page.extract_tables()
+                for table in tables:
+                    for row in table:
+                        # Saltar filas vacías o de header
+                        if not row or len(row) < 4:
+                            continue
+                        
+                        # Detectar header / fila de transición
+                        first_cell = (row[0] or '').strip()
+                        second_cell = (row[1] or '').strip() if len(row) > 1 else ''
+                        
+                        # Saltar headers conocidos
+                        if any(k in first_cell for k in ['图片', 'Foto', 'MOREKA', 'VIP']):
+                            continue
+                        if 'Los siguientes están agotados' in (row[0] or ''):
+                            continue
+                        if not second_cell:
+                            continue
+                        
+                        # Columnas típicas:
+                        # [0]=foto, [1]=precio/estado, [2]=modelo, [3]=cantidad, [4]=nombre, [5]=características
+                        price_cell = second_cell
+                        model = ''
+                        pieces = ''
+                        name = ''
+                        is_agotado = False
+                        price = 0.0
+                        
+                        # Detectar si es producto agotado
+                        if 'agotado' in price_cell.lower():
+                            is_agotado = True
+                            # Modelo está en la siguiente columna (índice 2)
+                            if len(row) > 2 and row[2]:
+                                model = row[2].strip().replace('\n', ' ')
+                            # Cantidad en índice 3
+                            if len(row) > 3 and row[3]:
+                                pieces = str(row[3]).strip().replace('\n', ' ')
+                            # Nombre en índice 4
+                            if len(row) > 4 and row[4]:
+                                name = row[4].strip().replace('\n', ' ')
+                        else:
+                            # Producto con precio
+                            # Extraer primer precio (puede tener escalas separadas por \n)
+                            price_lines = price_cell.split('\n')
+                            first_price_line = price_lines[0].strip()
+                            
+                            # Quitar $ y convertir a float
+                            price_str = first_price_line.replace('$', '').replace(',', '.')
+                            try:
+                                price = float(price_str)
+                            except ValueError:
+                                continue  # No es una fila de producto válida
+                            
+                            # Modelo en índice 2
+                            if len(row) > 2 and row[2]:
+                                model = row[2].strip().replace('\n', ' ')
+                            # Cantidad en índice 3
+                            if len(row) > 3 and row[3]:
+                                pieces = str(row[3]).strip().replace('\n', ' ')
+                            # Nombre en índice 4
+                            if len(row) > 4 and row[4]:
+                                name = row[4].strip().replace('\n', ' ')
+                        
+                        # Validar que tengamos modelo
+                        if not model:
+                            continue
+                        
+                        # El modelo debe parecer un código (letras, números, guiones)
+                        # No debe ser una palabra larga tipo "VENTILADOR" o "FOCOVENTILADOR"
+                        # Patrón típico: FS-133, SF110, MT-021, K108, WE017, etc.
+                        model_clean = model.replace('-', '').replace('_', '')
+                        if not re.match(r'^[A-Za-z0-9]+$', model_clean):
+                            continue
+                        if len(model) > 15:
+                            continue  # Probablemente es texto, no un código
+                        
+                        data.append({
+                            'modelo': model,
+                            'precio_nuevo': price,
+                            'piezas_caja': pieces,
+                            'nombre': name[:80],
+                            'agotado': is_agotado,
+                        })
             
-            # Detectar si es línea de agotado o con precio
-            is_agotado = line.lower().startswith('agotado')
-            
-            if is_agotado:
-                # Formato: agotado [MODELO] [cantidad] [nombre]
-                tokens = line.split()
-                if len(tokens) < 3:
-                    continue
-                model = tokens[1]
-                # Cantidad: tercer token (número, posiblemente con paréntesis como 60(4))
-                qty_token = tokens[2]
-                if not re.match(r'\d+(?:\([^)]*\))?', qty_token):
-                    continue
-                pieces = qty_token
-                name = ' '.join(tokens[3:])
-                # Precio 0 para agotados (se marcarán como no disponible)
-                price = 0.0
-                
-            else:
-                # Formato: $[precio] [opcional: escala] [MODELO] [cantidad] [nombre]
-                if not line.startswith('$'):
-                    continue
-                
-                tokens = line.split()
-                if len(tokens) < 4:
-                    continue
-                
-                # Precio: primer token (quitar $)
-                price_str = tokens[0].replace('$', '').replace(',', '.')
-                try:
-                    price = float(price_str)
-                except:
-                    continue
-                
-                # Buscar el modelo: es el token que parece un modelo (formato: letras+guiones+números)
-                # y NO es escala y NO es cantidad
-                # Escala: "50cajas:$130" o "100cajas:125"
-                model = None
-                pieces = None
-                name_start_idx = None
-                
-                for i, token in enumerate(tokens[1:], start=1):
-                    # Saltar tokens de escala
-                    if re.match(r'\d+cajas:', token, re.IGNORECASE):
-                        continue
-                    # El modelo coincide con patrón: empieza con letra, tiene letras/números/guiones, longitud 2-10
-                    if model is None and re.match(r'^[A-Za-z][A-Za-z0-9\-]{1,10}$', token):
-                        model = token
-                        continue
-                    # La cantidad es el primer número después del modelo
-                    if model is not None and pieces is None:
-                        if re.match(r'\d+(?:\([^)]*\))?', token):
-                            pieces = token
-                            name_start_idx = i + 1
-                            break
-                
-                if model is None or pieces is None:
-                    continue
-                
-                name = ' '.join(tokens[name_start_idx:]) if name_start_idx else ''
-            
-            if model:
-                data.append({
-                    'modelo': model.strip(),
-                    'precio_nuevo': price,
-                    'piezas_caja': pieces.strip(),
-                    'nombre': name.strip()[:50],  # Limitar nombre
-                    'agotado': is_agotado
-                })
-        
-        return data
+            return data
     except Exception as e:
         st.error(f"Error leyendo PDF: {e}")
         return []
