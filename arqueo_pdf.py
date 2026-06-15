@@ -217,6 +217,8 @@ def fetch_page(offset, limit=50):
                 'variant_id': v.get('id'),
                 'variant_desc': v.get('description', ''),
                 'variant_code': v.get('code', ''),
+                'sku': v.get('code', '') or v.get('barCode', ''),
+                'barcode': v.get('barCode', ''),
                 'stock': v.get('stock', 0),
                 'costo_promedio': v.get('averageCost', 0)
             })
@@ -579,26 +581,39 @@ def do_arqueo_fast(pdf_data, bsale_df):
     model_to_variants = {}
     for _, row in bsale_df.iterrows():
         name = row['product_name'].upper()
-        # También crear versión sin guiones del nombre para buscar
         name_normalized = normalize_model(name)
+        variant_desc = normalize_model(row.get('variant_desc', '') or '')
+        sku = normalize_model(row.get('sku', '') or '')
+        barcode = normalize_model(row.get('barcode', '') or '')
+        variant_code = normalize_model(row.get('variant_code', '') or '')
         
         for pdf_item in pdf_data:
             model = pdf_item['modelo']
             model_norm = normalize_model(model)
             
-            # Intentar match de 3 formas:
+            # Intentar match en múltiples campos:
             # 1. Modelo exacto en nombre
             # 2. Modelo normalizado en nombre normalizado
-            # 3. Modelo sin guiones en nombre sin guiones
+            # 3. Modelo normalizado en descripción de variante
+            # 4. Modelo normalizado en SKU
+            # 5. Modelo normalizado en barcode
+            # 6. Modelo normalizado en código de variante
             match_found = False
             
             if model.upper() in name:
                 match_found = True
             elif model_norm in name_normalized:
                 match_found = True
-            elif len(model_norm) >= 3:  # Solo buscar substrings si el modelo es largo
-                # Buscar el modelo sin guiones dentro del nombre sin guiones
-                if model_norm in name_normalized:
+            elif model_norm in variant_desc:
+                match_found = True
+            elif model_norm == sku:
+                match_found = True
+            elif model_norm == barcode:
+                match_found = True
+            elif model_norm == variant_code:
+                match_found = True
+            elif len(model_norm) >= 3:
+                if model_norm in sku or model_norm in barcode or model_norm in variant_code:
                     match_found = True
             
             if match_found:
@@ -618,6 +633,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
                     'producto_bsale': row['product_name'],
                     'variante': row['variant_desc'],
                     'codigo': row['variant_code'],
+                    'sku': row.get('sku', ''),
                     'stock': row['stock'],
                     'offices': row.get('offices', ''),
                     'variant_id': str(row['variant_id']),
@@ -811,12 +827,18 @@ with tab_arqueo:
                         
                         # Si filtro por fecha está activo, filtrar solo productos con recepción posterior
                         if usar_filtro_fecha and fecha_ref_dt:
+                            # Guardar los filtrados ANTES de filtrar el dataframe
+                            filtrados_df = matches_df[matches_df.get('tipo_stock', pd.Series(['']*len(matches_df))) == 'FILTRADO_POR_FECHA'].copy()
                             matches_df = matches_df[matches_df.get('recepcion_post', pd.Series([False]*len(matches_df))) == True].copy()
                             if matches_df.empty:
                                 st.warning("⚠️ Ninguno de los productos encontrados tiene recepciones después de la fecha de referencia.")
                                 st.stop()
                             else:
                                 st.success(f"✅ **{len(matches_df)}** productos con recepciones después de {fecha_ref_dt.strftime('%Y-%m-%d')}")
+                                if len(filtrados_df) > 0:
+                                    st.info(f"ℹ️ **{len(filtrados_df)}** productos fueron filtrados (sin recepciones después de la fecha). Ver pestaña '🚫 Filtrados por Fecha'.")
+                        else:
+                            filtrados_df = pd.DataFrame()
                         
                         matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
                         matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
@@ -884,7 +906,7 @@ with tab_arqueo:
                         st.dataframe(nf[['modelo_pdf', 'nombre', 'precio_nuevo', 'piezas_caja']], use_container_width=True, height=180)
                     
                     st.markdown('<div class="section-title">📋 Detalle por Tipo de Stock</div>', unsafe_allow_html=True)
-                    tab1, tab2, tab3, tab4 = st.tabs(["🔴 Stock Precio Viejo", "🟢 Stock Precio Nuevo", "⚪ Sin Stock", "❓ Sin Recepción"])
+                    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔴 Stock Precio Viejo", "🟢 Stock Precio Nuevo", "⚪ Sin Stock", "❓ Sin Recepción", "🚫 Filtrados por Fecha"])
                     
                     with tab1:
                         if not stock_viejo_df.empty:
@@ -933,6 +955,13 @@ with tab_arqueo:
                             st.dataframe(sin_recepcion_df[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices']], use_container_width=True, height=180)
                         else:
                             st.info("Todos los productos tienen historial de recepción.")
+                    
+                    with tab5:
+                        if 'filtrados_df' in locals() and not filtrados_df.empty:
+                            st.warning(f"⚠️ **{len(filtrados_df)}** productos filtrados por fecha (sin recepciones después de {fecha_ref_dt.strftime('%Y-%m-%d')})")
+                            st.dataframe(filtrados_df[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'ultima_recepcion', 'offices']], use_container_width=True, height=180)
+                        else:
+                            st.info("No hay productos filtrados por fecha.")
                     
                     # --- DESCARGA UNIFICADA ---
                     matches_export = matches_df.copy() if not matches_df.empty else pd.DataFrame()
