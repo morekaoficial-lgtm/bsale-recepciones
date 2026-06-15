@@ -822,11 +822,9 @@ with tab_arqueo:
                         matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
                         
                         matches_df['diferencia'] = 0.0
-                        mask_valid = (matches_df['precio_nuevo'] > 0) & (matches_df['costo_viejo'] > 0)
+                        mask_valid = (matches_df['precio_nuevo'] > 0) & (matches_df['costo_viejo'] > 0) & (matches_df['stock_viejo'] > 0)
                         matches_df.loc[mask_valid, 'diferencia'] = (
-                            matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'precio_nuevo']
-                        ) - (
-                            matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'costo_viejo']
+                            matches_df.loc[mask_valid, 'stock_viejo'] * (matches_df.loc[mask_valid, 'precio_nuevo'] - matches_df.loc[mask_valid, 'costo_viejo'])
                         )
                         
                         matches_df['subida'] = 0.0
