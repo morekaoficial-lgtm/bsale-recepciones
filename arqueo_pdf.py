@@ -231,7 +231,21 @@ def fetch_reception_page(offset, limit=50):
     
     all_details = []
     for item in items:
-        reception_date = item.get('receptionDate', '') or item.get('date', '')
+        # Bsale usa admissionDate (timestamp Unix) o rawAdmissionDate (YYYY-MM-DD)
+        # No usa receptionDate
+        admission_date = item.get('admissionDate', '')
+        raw_date = item.get('rawAdmissionDate', '')
+        
+        reception_date = ''
+        if raw_date:
+            reception_date = raw_date  # YYYY-MM-DD
+        elif admission_date:
+            # Convertir timestamp Unix a string YYYY-MM-DD
+            try:
+                reception_date = datetime.fromtimestamp(int(admission_date)).strftime('%Y-%m-%d')
+            except:
+                reception_date = ''
+        
         details = item.get('details', {})
         if isinstance(details, dict) and 'items' in details:
             for d in details.get('items', []):
