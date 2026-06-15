@@ -196,22 +196,52 @@ def get_json(url):
         return resp.json()
     return {}
 
-def fetch_page(offset, limit=50):
-    """Fetch una página de productos con variantes"""
-    url = f"{BASE_URL}/products.json?limit={limit}&offset={offset}&expand=variants"
+def build_modelo_attr_map():
+    """Construye un mapa de product_type_id -> attribute_id para el atributo 'Modelo'."""
+    modelo_map = {}
+    try:
+        data = get_json(f"{BASE_URL}/product_types.json?expand=attributes")
+        for pt in data.get('items', []):
+            pt_id = str(pt.get('id', ''))
+            attrs = pt.get('attributes', {}).get('items', [])
+            for attr in attrs:
+                attr_name = attr.get('name', '').strip().lower()
+                if attr_name == 'modelo':
+                    modelo_map[pt_id] = str(attr.get('id', ''))
+                    break
+    except Exception as e:
+        st.warning(f"No se pudieron cargar atributos de product types: {e}")
+    return modelo_map
+
+def fetch_page_with_modelo(offset, limit=50, modelo_map=None):
+    """Fetch una página de productos con variantes, incluyendo atributo 'Modelo' de attribute_values."""
+    url = f"{BASE_URL}/products.json?limit={limit}&offset={offset}&expand=variants[product,attribute_values]"
     data = get_json(url)
     items = data.get('items', [])
     
     results = []
     for item in items:
         prod_name = item.get('name', '')
+        prod_type_id = str(item.get('product_type', {}).get('id', ''))
+        modelo_attr_id = modelo_map.get(prod_type_id, '') if modelo_map else ''
+        
         variants = item.get('variants', {}).get('items', [])
         if not variants:
-            var_url = f"{BASE_URL}/products/{item.get('id')}/variants.json"
+            var_url = f"{BASE_URL}/products/{item.get('id')}/variants.json?expand=product,attribute_values"
             v_data = get_json(var_url)
             variants = v_data.get('items', [])
         
         for v in variants:
+            # Extraer atributo 'Modelo' de attribute_values
+            modelo_val = ''
+            if modelo_attr_id:
+                av_items = v.get('attribute_values', {}).get('items', [])
+                for av in av_items:
+                    av_attr_id = str(av.get('attribute', {}).get('id', ''))
+                    if av_attr_id == modelo_attr_id:
+                        modelo_val = av.get('description', '') or ''
+                        break
+            
             results.append({
                 'product_name': prod_name,
                 'variant_id': v.get('id'),
@@ -220,7 +250,8 @@ def fetch_page(offset, limit=50):
                 'sku': v.get('code', '') or v.get('barCode', ''),
                 'barcode': v.get('barCode', ''),
                 'stock': v.get('stock', 0),
-                'costo_promedio': v.get('averageCost', 0)
+                'costo_promedio': v.get('averageCost', 0),
+                'modelo': modelo_val,
             })
     
     return results, len(items)
@@ -339,12 +370,16 @@ def get_total_stock_by_variant():
     return stock_by_variant
 
 def fetch_all_products_fast():
-    """Obtiene todos los productos con stock REAL de todas las oficinas"""
+    """Obtiene todos los productos con stock REAL de todas las oficinas, incluyendo atributo Modelo."""
     data = get_json(f"{BASE_URL}/products.json?limit=1&offset=0")
     total_count = data.get('count', 0)
     
     if total_count == 0:
         return pd.DataFrame()
+    
+    # Paso 0: Obtener mapa de atributo Modelo por tipo de producto
+    modelo_map = build_modelo_attr_map()
+    st.info(f"🔧 Atributo 'Modelo' detectado en {len(modelo_map)} tipos de producto.")
     
     # Paso 1: Obtener productos y variantes
     limit = 50
@@ -352,7 +387,7 @@ def fetch_all_products_fast():
     
     all_results = []
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_page, off, limit): off for off in offsets}
+        futures = {executor.submit(fetch_page_with_modelo, off, limit, modelo_map): off for off in offsets}
         
         progress_bar = st.progress(0)
         completed = 0
@@ -586,6 +621,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
         sku = normalize_model(row.get('sku', '') or '')
         barcode = normalize_model(row.get('barcode', '') or '')
         variant_code = normalize_model(row.get('variant_code', '') or '')
+        modelo_attr = normalize_model(row.get('modelo', '') or '')  # Atributo personalizado 'Modelo' de Bsale
         
         for pdf_item in pdf_data:
             model = pdf_item['modelo']
@@ -598,6 +634,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
             # 4. Modelo normalizado en SKU
             # 5. Modelo normalizado en barcode
             # 6. Modelo normalizado en código de variante
+            # 7. Modelo normalizado en atributo personalizado 'Modelo' de Bsale
             match_found = False
             
             if model.upper() in name:
@@ -612,8 +649,10 @@ def do_arqueo_fast(pdf_data, bsale_df):
                 match_found = True
             elif model_norm == variant_code:
                 match_found = True
+            elif model_norm == modelo_attr:  # Match en atributo personalizado 'Modelo'
+                match_found = True
             elif len(model_norm) >= 3:
-                if model_norm in sku or model_norm in barcode or model_norm in variant_code:
+                if model_norm in sku or model_norm in barcode or model_norm in variant_code or model_norm in modelo_attr:
                     match_found = True
             
             if match_found:
@@ -634,6 +673,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
                     'variante': row['variant_desc'],
                     'codigo': row['variant_code'],
                     'sku': row.get('sku', ''),
+                    'modelo_bsale': row.get('modelo', ''),  # Atributo personalizado 'Modelo'
                     'stock': row['stock'],
                     'offices': row.get('offices', ''),
                     'variant_id': str(row['variant_id']),
