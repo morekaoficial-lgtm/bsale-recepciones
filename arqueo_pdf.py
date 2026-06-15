@@ -573,7 +573,26 @@ else:
                     # Calcular valores solo para stock viejo
                     matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
                     matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
-                    matches_df['diferencia'] = matches_df['stock_viejo'] * (matches_df['precio_nuevo'] - matches_df['costo_viejo'])
+                    
+                    # Diferencia: 0 si falta algún precio
+                    matches_df['diferencia'] = 0.0
+                    mask_valid = (matches_df['precio_nuevo'] > 0) & (matches_df['costo_viejo'] > 0)
+                    matches_df.loc[mask_valid, 'diferencia'] = (
+                        matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'precio_nuevo']
+                    ) - (
+                        matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'costo_viejo']
+                    )
+                    
+                    # Subida de precio (solo cuando precio nuevo > precio viejo)
+                    matches_df['subida'] = 0.0
+                    mask_subida = mask_valid & (matches_df['precio_nuevo'] > matches_df['costo_viejo'])
+                    matches_df.loc[mask_subida, 'subida'] = matches_df.loc[mask_subida, 'diferencia']
+                    
+                    # Bajada de precio (solo cuando precio nuevo < precio viejo)
+                    matches_df['bajada'] = 0.0
+                    mask_bajada = mask_valid & (matches_df['precio_nuevo'] < matches_df['costo_viejo'])
+                    matches_df.loc[mask_bajada, 'bajada'] = matches_df.loc[mask_bajada, 'diferencia']
+                    
                     matches_df['necesita_ajuste'] = (matches_df['stock_viejo'] > 0) & (matches_df['costo_viejo'] > 0)
                     
                     # Asegurar que 'offices' existe
@@ -628,15 +647,20 @@ else:
                         d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
                         d['valor_viejo'] = d['valor_viejo'].apply(lambda x: f"${x:,.2f}")
                         d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'offices', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'diferencia']], use_container_width=True, height=350)
+                        d['subida'] = d['subida'].apply(lambda x: f"${x:,.2f}")
+                        d['bajada'] = d['bajada'].apply(lambda x: f"${x:,.2f}")
+                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'offices', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'diferencia', 'subida', 'bajada']], use_container_width=True, height=350)
                         
                         total_v = stock_viejo_df['valor_viejo'].sum()
                         total_d = stock_viejo_df['diferencia'].sum()
+                        total_subida = stock_viejo_df['subida'].sum()
+                        total_bajada = stock_viejo_df['bajada'].sum()
                         st.markdown('<div class="section-title">📝 Nota de Crédito (Stock Viejo)</div>', unsafe_allow_html=True)
-                        c1, c2, c3 = st.columns(3)
+                        c1, c2, c3, c4 = st.columns(4)
                         c1.metric("Valor Viejo", f"${total_v:,.2f}")
-                        c2.metric("Diferencia a Ajustar", f"${total_d:,.2f}")
-                        c3.metric("Unidades", f"{total_stock_viejo:,.0f}")
+                        c2.metric("Diferencia Total", f"${total_d:,.2f}")
+                        c3.metric("Subida de Precio", f"${total_subida:,.2f}")
+                        c4.metric("Bajada de Precio", f"${total_bajada:,.2f}")
                     else:
                         st.success("✅ Ningún stock con precio viejo.")
                 
@@ -683,6 +707,8 @@ else:
                     not_found_export['valor_viejo'] = 0
                     not_found_export['valor_nuevo'] = 0
                     not_found_export['diferencia'] = 0
+                    not_found_export['subida'] = 0
+                    not_found_export['bajada'] = 0
                     not_found_export['necesita_ajuste'] = False
                 
                 # Unir ambos
