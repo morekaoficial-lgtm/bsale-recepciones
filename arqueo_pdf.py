@@ -796,13 +796,13 @@ with tab_arqueo:
                                     matches_df.loc[idx, 'ultima_recepcion'] = ''
                         
                         # Si filtro por fecha está activo, filtrar solo productos con recepción posterior
-                        if usar_filtro_fecha and fecha_ref_str:
+                        if usar_filtro_fecha and fecha_ref_dt:
                             matches_df = matches_df[matches_df.get('recepcion_post', pd.Series([False]*len(matches_df))) == True].copy()
                             if matches_df.empty:
                                 st.warning("⚠️ Ninguno de los productos encontrados tiene recepciones después de la fecha de referencia.")
                                 st.stop()
                             else:
-                                st.success(f"✅ **{len(matches_df)}** productos con recepciones después de {fecha_ref_str}")
+                                st.success(f"✅ **{len(matches_df)}** productos con recepciones después de {fecha_ref_dt.strftime('%Y-%m-%d')}")
                         
                         matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
                         matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
