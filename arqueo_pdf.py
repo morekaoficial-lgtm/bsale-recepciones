@@ -2,11 +2,121 @@ import streamlit as st
 import requests
 import re
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 import io
+import json
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Bsale - Arqueo de Precios (PDF)", page_icon="📊", layout="wide")
+
+# ==================== PERSISTENCIA ====================
+DATA_DIR = Path(__file__).parent / "data"
+ARQUEOS_DIR = DATA_DIR / "arqueos"
+NOTAS_FILE = DATA_DIR / "notas_credito.json"
+ARQUEOS_INDEX = ARQUEOS_DIR / "arqueos_index.json"
+
+def _ensure_dirs():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ARQUEOS_DIR.mkdir(parents=True, exist_ok=True)
+
+_ensure_dirs()
+
+def save_arqueo(timestamp, archivos, matches_df, not_found_df, pdf_stats):
+    """Guarda un arqueo completo en disco"""
+    arqueo_id = timestamp.strftime('%Y%m%d_%H%M%S')
+    
+    # Guardar CSV del detalle
+    csv_path = ARQUEOS_DIR / f"{arqueo_id}.csv"
+    if not matches_df.empty:
+        matches_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    
+    # Guardar no encontrados
+    if not not_found_df.empty:
+        not_found_df.to_csv(ARQUEOS_DIR / f"{arqueo_id}_no_encontrados.csv", index=False, encoding='utf-8-sig')
+    
+    # Actualizar índice
+    index = load_arqueos_index()
+    stats = {
+        'total_encontrados': len(matches_df),
+        'total_no_encontrados': len(not_found_df),
+        'stock_viejo_total': float(matches_df['stock_viejo'].sum()) if not matches_df.empty and 'stock_viejo' in matches_df.columns else 0,
+        'stock_nuevo_total': float(matches_df['stock_nuevo'].sum()) if not matches_df.empty and 'stock_nuevo' in matches_df.columns else 0,
+        'diferencia_total': float(matches_df['diferencia'].sum()) if not matches_df.empty and 'diferencia' in matches_df.columns else 0,
+        'subida_total': float(matches_df['subida'].sum()) if not matches_df.empty and 'subida' in matches_df.columns else 0,
+        'bajada_total': float(matches_df['bajada'].sum()) if not matches_df.empty and 'bajada' in matches_df.columns else 0,
+    }
+    
+    entry = {
+        'id': arqueo_id,
+        'fecha': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+        'archivos': archivos,
+        'pdf_stats': pdf_stats,
+        'stats': stats,
+    }
+    index.insert(0, entry)
+    
+    with open(ARQUEOS_INDEX, 'w', encoding='utf-8') as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+    
+    return arqueo_id
+
+def load_arqueos_index():
+    """Carga el índice de arqueos guardados"""
+    if not ARQUEOS_INDEX.exists():
+        return []
+    with open(ARQUEOS_INDEX, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def load_arqueo_csv(arqueo_id):
+    """Carga el CSV de un arqueo específico"""
+    csv_path = ARQUEOS_DIR / f"{arqueo_id}.csv"
+    if csv_path.exists():
+        return pd.read_csv(csv_path, encoding='utf-8-sig')
+    return pd.DataFrame()
+
+def load_arqueo_no_encontrados(arqueo_id):
+    """Carga los no encontrados de un arqueo"""
+    csv_path = ARQUEOS_DIR / f"{arqueo_id}_no_encontrados.csv"
+    if csv_path.exists():
+        return pd.read_csv(csv_path, encoding='utf-8-sig')
+    return pd.DataFrame()
+
+def save_nota_credito(arqueo_id, fecha_pago, monto, descripcion):
+    """Registra un pago de nota de crédito asociado a un arqueo"""
+    notas = load_notas_credito()
+    nota_id = f"NC_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    notas.append({
+        'id': nota_id,
+        'arqueo_id': arqueo_id,
+        'fecha_pago': fecha_pago,
+        'monto': float(monto),
+        'descripcion': descripcion,
+        'registrado_en': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    })
+    with open(NOTAS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(notas, f, ensure_ascii=False, indent=2)
+    return nota_id
+
+def load_notas_credito():
+    """Carga todas las notas de crédito"""
+    if not NOTAS_FILE.exists():
+        return []
+    with open(NOTAS_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def get_arqueos_con_nota_credito():
+    """Devuelve los IDs de arqueos que ya tienen nota de crédito pagada"""
+    notas = load_notas_credito()
+    return set(n['arqueo_id'] for n in notas)
+
+def get_ultima_fecha_nota_credito(arqueo_id):
+    """Devuelve la fecha del último pago de nota de crédito para un arqueo"""
+    notas = load_notas_credito()
+    notas_arqueo = [n for n in notas if n['arqueo_id'] == arqueo_id]
+    if not notas_arqueo:
+        return None
+    return max(n['fecha_pago'] for n in notas_arqueo)
 
 # ==================== CONFIGURACIÓN ====================
 ACCESS_TOKEN = "027fa2348b50d5ecd2d2a469f07c464e85cf176d"
@@ -467,6 +577,7 @@ def do_arqueo_fast(pdf_data, bsale_df):
     
     return pd.DataFrame(matches), pd.DataFrame(not_found)
 
+
 # ==================== UI ====================
 st.markdown('<div class="main-header">📊 Bsale — Arqueo de Precios (PDF)</div>', unsafe_allow_html=True)
 st.markdown('<div class="subheader">Compara lista VIP de proveedor con tu inventario Bsale y genera nota de crédito</div>', unsafe_allow_html=True)
@@ -476,272 +587,551 @@ if 'bsale_df' not in st.session_state:
 if 'step' not in st.session_state:
     st.session_state.step = 1
 
-# --- PASO 1: CARGAR BSALE ---
-if st.session_state.step == 1:
-    st.markdown('<div class="section-title">⚡ Paso 1: Cargar Inventario Bsale</div>', unsafe_allow_html=True)
-    
-    if st.button("🔄 Cargar Productos Bsale (Paralelo)", type="primary", use_container_width=True):
-        with st.spinner("Cargando catálogo completo..."):
-            bsale_df = fetch_all_products_fast()
-            st.session_state.bsale_df = bsale_df
-            st.session_state.step = 2
-        st.success(f"✅ **{len(bsale_df)}** variantes cargadas")
-        st.rerun()
+tab_arqueo, tab_historial, tab_notas, tab_fecha = st.tabs(["📊 Arqueo", "📋 Historial", "💳 Notas de Crédito", "🔍 Arqueo por Fecha"])
 
-# --- PASO 2: SUBIR PDF Y ARQUEAR ---
-else:
-    st.markdown('<div class="section-title">📁 Paso 2: Subir PDF de Lista VIP</div>', unsafe_allow_html=True)
-    st.success(f"✅ Bsale conectado: **{len(st.session_state.bsale_df)}** variantes cargadas")
-    
-    uploaded_files = st.file_uploader("Selecciona los PDFs (lista VIP de proveedor)", type=['pdf'], accept_multiple_files=True)
-    
-    if uploaded_files:
-        all_pdf_data = []
-        pdf_stats = []
+# ============================================================
+# TAB 1: ARQUEO (contenido original)
+# ============================================================
+with tab_arqueo:
+    if st.session_state.step == 1:
+        st.markdown('<div class="section-title">⚡ Paso 1: Cargar Inventario Bsale</div>', unsafe_allow_html=True)
         
-        for pdf_file in uploaded_files:
-            with st.spinner(f"Extrayendo datos de {pdf_file.name}..."):
-                pdf_data = extract_pdf_data(io.BytesIO(pdf_file.read()))
-                all_pdf_data.extend(pdf_data)
-                pdf_stats.append({
-                    'archivo': pdf_file.name,
-                    'total': len(pdf_data),
-                    'disponibles': sum(1 for d in pdf_data if not d['agotado']),
-                    'agotados': sum(1 for d in pdf_data if d['agotado'])
-                })
+        if st.button("🔄 Cargar Productos Bsale (Paralelo)", type="primary", use_container_width=True):
+            with st.spinner("Cargando catálogo completo..."):
+                bsale_df = fetch_all_products_fast()
+                st.session_state.bsale_df = bsale_df
+                st.session_state.step = 2
+            st.success(f"✅ **{len(bsale_df)}** variantes cargadas")
+            st.rerun()
+    else:
+        st.markdown('<div class="section-title">📁 Paso 2: Subir PDF de Lista VIP</div>', unsafe_allow_html=True)
+        st.success(f"✅ Bsale conectado: **{len(st.session_state.bsale_df)}** variantes cargadas")
         
-        if all_pdf_data:
-            st.success(f"✅ **{len(all_pdf_data)}** modelos encontrados en total ({len(uploaded_files)} PDFs)")
+        uploaded_files = st.file_uploader("Selecciona los PDFs (lista VIP de proveedor)", type=['pdf'], accept_multiple_files=True)
+        
+        if uploaded_files:
+            all_pdf_data = []
+            pdf_stats = []
             
-            # Mostrar resumen por PDF
-            stats_df = pd.DataFrame(pdf_stats)
-            st.dataframe(stats_df, use_container_width=True, height=150)
+            for pdf_file in uploaded_files:
+                with st.spinner(f"Extrayendo datos de {pdf_file.name}..."):
+                    pdf_data = extract_pdf_data(io.BytesIO(pdf_file.read()))
+                    all_pdf_data.extend(pdf_data)
+                    pdf_stats.append({
+                        'archivo': pdf_file.name,
+                        'total': len(pdf_data),
+                        'disponibles': sum(1 for d in pdf_data if not d['agotado']),
+                        'agotados': sum(1 for d in pdf_data if d['agotado'])
+                    })
             
-            # Mostrar preview de todos los modelos
-            with st.expander("📋 Ver todos los modelos extraídos"):
-                st.dataframe(pd.DataFrame(all_pdf_data), use_container_width=True, height=300)
-            
-            if st.button("🚀 ARQUEAR AHORA", type="primary", use_container_width=True):
-                with st.spinner("Buscando coincidencias en Bsale..."):
-                    matches_df, not_found = do_arqueo_fast(all_pdf_data, st.session_state.bsale_df)
+            if all_pdf_data:
+                st.success(f"✅ **{len(all_pdf_data)}** modelos encontrados en total ({len(uploaded_files)} PDFs)")
                 
-                st.info(f"📊 Encontrados: {len(matches_df)} matches | {len(not_found)} no encontrados")
+                stats_df = pd.DataFrame(pdf_stats)
+                st.dataframe(stats_df, use_container_width=True, height=150)
                 
-                if matches_df.empty or len(matches_df) == 0:
-                    st.warning("⚠️ No se encontraron coincidencias entre el PDF y Bsale. Verifica los modelos.")
-                else:
-                    # Obtener historial completo de recepciones y calcular FIFO
-                    # Asegurar que costo_viejo sea float
-                    matches_df['costo_viejo'] = matches_df['costo_viejo'].astype(float)
-                    matches_df['stock'] = matches_df['stock'].astype(float)
+                with st.expander("📋 Ver todos los modelos extraídos"):
+                    st.dataframe(pd.DataFrame(all_pdf_data), use_container_width=True, height=300)
+                
+                if st.button("🚀 ARQUEAR AHORA", type="primary", use_container_width=True):
+                    with st.spinner("Buscando coincidencias en Bsale..."):
+                        matches_df, not_found = do_arqueo_fast(all_pdf_data, st.session_state.bsale_df)
                     
-                    variant_ids = matches_df['variant_id'].unique().tolist()
-                    st.write(f"🔍 Buscando historial de recepciones para {len(variant_ids)} variantes...")
-                    reception_history = get_reception_history_for_variants(variant_ids)
-                    st.write(f"✅ Historial obtenido: {len(reception_history)} variantes con recepciones")
+                    st.info(f"📊 Encontrados: {len(matches_df)} matches | {len(not_found)} no encontrados")
                     
-                    # Calcular FIFO para cada variante
-                    for idx, row in matches_df.iterrows():
-                        v_id = str(row['variant_id'])
-                        precio_nuevo = row['precio_nuevo']
-                        stock_total = row['stock']
+                    if matches_df.empty or len(matches_df) == 0:
+                        st.warning("⚠️ No se encontraron coincidencias entre el PDF y Bsale. Verifica los modelos.")
+                    else:
+                        matches_df['costo_viejo'] = matches_df['costo_viejo'].astype(float)
+                        matches_df['stock'] = matches_df['stock'].astype(float)
                         
-                        if v_id in reception_history and stock_total > 0:
-                            history = reception_history[v_id]
-                            fifo_result = calculate_fifo_stock(stock_total, history)
+                        variant_ids = matches_df['variant_id'].unique().tolist()
+                        st.write(f"🔍 Buscando historial de recepciones para {len(variant_ids)} variantes...")
+                        reception_history = get_reception_history_for_variants(variant_ids)
+                        st.write(f"✅ Historial obtenido: {len(reception_history)} variantes con recepciones")
+                        
+                        for idx, row in matches_df.iterrows():
+                            v_id = str(row['variant_id'])
+                            precio_nuevo = row['precio_nuevo']
+                            stock_total = row['stock']
                             
-                            # Calcular stock viejo y nuevo basado en FIFO
-                            stock_viejo = 0
-                            stock_nuevo = 0
-                            costo_viejo_promedio = 0
+                            if v_id in reception_history and stock_total > 0:
+                                history = reception_history[v_id]
+                                fifo_result = calculate_fifo_stock(stock_total, history)
+                                
+                                stock_viejo = 0
+                                stock_nuevo = 0
+                                costo_viejo_promedio = 0
+                                
+                                for lot in fifo_result:
+                                    if abs(lot['cost'] - precio_nuevo) < 0.01:
+                                        stock_nuevo += lot['quantity']
+                                    else:
+                                        stock_viejo += lot['quantity']
+                                
+                                if stock_viejo > 0:
+                                    viejo_lots = [lot for lot in fifo_result if abs(lot['cost'] - precio_nuevo) >= 0.01]
+                                    if viejo_lots:
+                                        costo_viejo_promedio = sum(lot['cost'] * lot['quantity'] for lot in viejo_lots) / stock_viejo
+                                
+                                matches_df.loc[idx, 'stock_viejo'] = stock_viejo
+                                matches_df.loc[idx, 'stock_nuevo'] = stock_nuevo
+                                matches_df.loc[idx, 'costo_viejo'] = costo_viejo_promedio if costo_viejo_promedio > 0 else row['costo_viejo']
+                                matches_df.loc[idx, 'tipo_stock'] = 'VIEJO' if stock_viejo > 0 else 'NUEVO' if stock_nuevo > 0 else 'SIN RECEPCIÓN'
+                            else:
+                                matches_df.loc[idx, 'stock_viejo'] = stock_total
+                                matches_df.loc[idx, 'stock_nuevo'] = 0
+                                matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
+                        
+                        matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
+                        matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
+                        
+                        matches_df['diferencia'] = 0.0
+                        mask_valid = (matches_df['precio_nuevo'] > 0) & (matches_df['costo_viejo'] > 0)
+                        matches_df.loc[mask_valid, 'diferencia'] = (
+                            matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'precio_nuevo']
+                        ) - (
+                            matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'costo_viejo']
+                        )
+                        
+                        matches_df['subida'] = 0.0
+                        mask_subida = mask_valid & (matches_df['precio_nuevo'] > matches_df['costo_viejo'])
+                        matches_df.loc[mask_subida, 'subida'] = matches_df.loc[mask_subida, 'diferencia']
+                        
+                        matches_df['bajada'] = 0.0
+                        mask_bajada = mask_valid & (matches_df['precio_nuevo'] < matches_df['costo_viejo'])
+                        matches_df.loc[mask_bajada, 'bajada'] = matches_df.loc[mask_bajada, 'diferencia']
+                        
+                        matches_df['necesita_ajuste'] = (matches_df['stock_viejo'] > 0) & (matches_df['costo_viejo'] > 0)
+                        
+                        if 'offices' not in matches_df.columns:
+                            matches_df['offices'] = ''
+                        
+                        st.write(f"✅ Procesamiento completado. Mostrando resultados...")
+                        
+                        # ===== GUARDAR ARQUEO =====
+                        arqueo_id = save_arqueo(
+                            datetime.now(),
+                            [f.name for f in uploaded_files],
+                            matches_df,
+                            not_found,
+                            pdf_stats
+                        )
+                        st.success(f"💾 Arqueo guardado en historial: **{arqueo_id}**")
+                    
+                    # --- RESUMEN ---
+                    st.markdown('<div class="section-title">📊 Resumen del Arqueo</div>', unsafe_allow_html=True)
+                    
+                    stock_viejo_df = matches_df[matches_df['tipo_stock'] == 'VIEJO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
+                    stock_nuevo_df = matches_df[matches_df['tipo_stock'] == 'NUEVO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
+                    sin_recepcion_df = matches_df[matches_df['tipo_stock'] == 'SIN RECEPCIÓN'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
+                    sin_stock_df = matches_df[matches_df['stock'] == 0] if not matches_df.empty else pd.DataFrame()
+                    
+                    total_stock_viejo = stock_viejo_df['stock_viejo'].sum() if not stock_viejo_df.empty else 0
+                    total_stock_nuevo = stock_nuevo_df['stock_nuevo'].sum() if not stock_nuevo_df.empty else 0
+                    total_diferencia = stock_viejo_df['diferencia'].sum() if not stock_viejo_df.empty else 0
+                    
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.markdown(f'<div class="metric-card metric-card-red"><div class="metric-value">{len(stock_viejo_df)}</div><div class="metric-label">🔴 Stock Precio Viejo</div></div>', unsafe_allow_html=True)
+                    m2.markdown(f'<div class="metric-card metric-card-green"><div class="metric-value">{len(stock_nuevo_df)}</div><div class="metric-label">🟢 Stock Precio Nuevo</div></div>', unsafe_allow_html=True)
+                    m3.markdown(f'<div class="metric-card metric-card-gray"><div class="metric-value">{len(sin_stock_df)}</div><div class="metric-label">⚪ Sin Stock</div></div>', unsafe_allow_html=True)
+                    m4.markdown(f'<div class="metric-card metric-card-orange"><div class="metric-value">${total_diferencia:,.2f}</div><div class="metric-label">💰 Diferencia Total</div></div>', unsafe_allow_html=True)
+                    
+                    st.markdown('<div class="section-title">📦 Cantidades de Stock</div>', unsafe_allow_html=True)
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Stock con Precio Viejo", f"{total_stock_viejo:,.0f} unidades")
+                    c2.metric("Stock con Precio Nuevo", f"{total_stock_nuevo:,.0f} unidades")
+                    c3.metric("Total Stock", f"{total_stock_viejo + total_stock_nuevo:,.0f} unidades")
+                    
+                    if not not_found.empty:
+                        st.markdown('<div class="section-title">❌ NO ENCONTRADOS EN BSALE</div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="not-found-box"><strong>⚠️ {len(not_found)} modelos</strong> del PDF no se encontraron en Bsale.</div>', unsafe_allow_html=True)
+                        nf = not_found.copy()
+                        nf['precio_nuevo'] = nf['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
+                        st.dataframe(nf[['modelo_pdf', 'nombre', 'precio_nuevo', 'piezas_caja']], use_container_width=True, height=180)
+                    
+                    st.markdown('<div class="section-title">📋 Detalle por Tipo de Stock</div>', unsafe_allow_html=True)
+                    tab1, tab2, tab3, tab4 = st.tabs(["🔴 Stock Precio Viejo", "🟢 Stock Precio Nuevo", "⚪ Sin Stock", "❓ Sin Recepción"])
+                    
+                    with tab1:
+                        if not stock_viejo_df.empty:
+                            st.markdown(f'<div class="highlight-box"><strong>{len(stock_viejo_df)}</strong> productos con stock a precio viejo</div>', unsafe_allow_html=True)
+                            d = stock_viejo_df.copy()
+                            d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
+                            d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
+                            d['valor_viejo'] = d['valor_viejo'].apply(lambda x: f"${x:,.2f}")
+                            d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
+                            d['subida'] = d['subida'].apply(lambda x: f"${x:,.2f}")
+                            d['bajada'] = d['bajada'].apply(lambda x: f"${x:,.2f}")
+                            st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'offices', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'diferencia', 'subida', 'bajada']], use_container_width=True, height=350)
                             
-                            for lot in fifo_result:
-                                if abs(lot['cost'] - precio_nuevo) < 0.01:
-                                    stock_nuevo += lot['quantity']
-                                else:
-                                    stock_viejo += lot['quantity']
-                            
-                            # Calcular costo promedio del stock viejo
-                            if stock_viejo > 0:
-                                viejo_lots = [lot for lot in fifo_result if abs(lot['cost'] - precio_nuevo) >= 0.01]
-                                if viejo_lots:
-                                    costo_viejo_promedio = sum(lot['cost'] * lot['quantity'] for lot in viejo_lots) / stock_viejo
-                            
-                            matches_df.loc[idx, 'stock_viejo'] = stock_viejo
-                            matches_df.loc[idx, 'stock_nuevo'] = stock_nuevo
-                            matches_df.loc[idx, 'costo_viejo'] = costo_viejo_promedio if costo_viejo_promedio > 0 else row['costo_viejo']
-                            matches_df.loc[idx, 'tipo_stock'] = 'VIEJO' if stock_viejo > 0 else 'NUEVO' if stock_nuevo > 0 else 'SIN RECEPCIÓN'
+                            total_v = stock_viejo_df['valor_viejo'].sum()
+                            total_d = stock_viejo_df['diferencia'].sum()
+                            total_subida = stock_viejo_df['subida'].sum()
+                            total_bajada = stock_viejo_df['bajada'].sum()
+                            st.markdown('<div class="section-title">📝 Nota de Crédito (Stock Viejo)</div>', unsafe_allow_html=True)
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("Valor Viejo", f"${total_v:,.2f}")
+                            c2.metric("Diferencia Total", f"${total_d:,.2f}")
+                            c3.metric("Subida de Precio", f"${total_subida:,.2f}")
+                            c4.metric("Bajada de Precio", f"${total_bajada:,.2f}")
                         else:
-                            matches_df.loc[idx, 'stock_viejo'] = stock_total
-                            matches_df.loc[idx, 'stock_nuevo'] = 0
-                            matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
+                            st.success("✅ Ningún stock con precio viejo.")
                     
-                    # Calcular valores solo para stock viejo
-                    matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
-                    matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
+                    with tab2:
+                        if not stock_nuevo_df.empty:
+                            st.info(f"ℹ️ **{len(stock_nuevo_df)}** productos ya con precio nuevo")
+                            d = stock_nuevo_df.copy()
+                            d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
+                            st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'precio_nuevo']], use_container_width=True, height=250)
+                        else:
+                            st.info("No hay stock con precio nuevo.")
                     
-                    # Diferencia: 0 si falta algún precio
-                    matches_df['diferencia'] = 0.0
-                    mask_valid = (matches_df['precio_nuevo'] > 0) & (matches_df['costo_viejo'] > 0)
-                    matches_df.loc[mask_valid, 'diferencia'] = (
-                        matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'precio_nuevo']
-                    ) - (
-                        matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'costo_viejo']
-                    )
+                    with tab3:
+                        if not sin_stock_df.empty:
+                            st.info(f"ℹ️ **{len(sin_stock_df)}** sin stock")
+                            st.dataframe(sin_stock_df[['modelo_pdf', 'producto_bsale', 'variante', 'offices']], use_container_width=True, height=180)
+                        else:
+                            st.info("No hay.")
                     
-                    # Subida de precio (solo cuando precio nuevo > precio viejo)
-                    matches_df['subida'] = 0.0
-                    mask_subida = mask_valid & (matches_df['precio_nuevo'] > matches_df['costo_viejo'])
-                    matches_df.loc[mask_subida, 'subida'] = matches_df.loc[mask_subida, 'diferencia']
+                    with tab4:
+                        if not sin_recepcion_df.empty:
+                            st.warning(f"⚠️ **{len(sin_recepcion_df)}** productos sin historial de recepción")
+                            st.dataframe(sin_recepcion_df[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices']], use_container_width=True, height=180)
+                        else:
+                            st.info("Todos los productos tienen historial de recepción.")
                     
-                    # Bajada de precio (solo cuando precio nuevo < precio viejo)
-                    matches_df['bajada'] = 0.0
-                    mask_bajada = mask_valid & (matches_df['precio_nuevo'] < matches_df['costo_viejo'])
-                    matches_df.loc[mask_bajada, 'bajada'] = matches_df.loc[mask_bajada, 'diferencia']
+                    # --- DESCARGA UNIFICADA ---
+                    matches_export = matches_df.copy() if not matches_df.empty else pd.DataFrame()
+                    if not matches_export.empty:
+                        matches_export['estado'] = 'Encontrado'
                     
-                    matches_df['necesita_ajuste'] = (matches_df['stock_viejo'] > 0) & (matches_df['costo_viejo'] > 0)
+                    not_found_export = not_found.copy() if not not_found.empty else pd.DataFrame()
+                    if not not_found_export.empty:
+                        not_found_export['estado'] = 'No Encontrado'
+                        not_found_export['producto_bsale'] = ''
+                        not_found_export['variante'] = ''
+                        not_found_export['codigo'] = ''
+                        not_found_export['stock'] = 0
+                        not_found_export['variant_id'] = ''
+                        not_found_export['costo_viejo'] = 0
+                        not_found_export['valor_viejo'] = 0
+                        not_found_export['valor_nuevo'] = 0
+                        not_found_export['diferencia'] = 0
+                        not_found_export['subida'] = 0
+                        not_found_export['bajada'] = 0
+                        not_found_export['necesita_ajuste'] = False
                     
-                    # Asegurar que 'offices' existe
-                    if 'offices' not in matches_df.columns:
-                        matches_df['offices'] = ''
-                    
-                    st.write(f"✅ Procesamiento completado. Mostrando resultados...")
-                
-                # --- RESUMEN ---
-                st.markdown('<div class="section-title">📊 Resumen del Arqueo</div>', unsafe_allow_html=True)
-                
-                # Clasificar por tipo de stock
-                stock_viejo_df = matches_df[matches_df['tipo_stock'] == 'VIEJO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
-                stock_nuevo_df = matches_df[matches_df['tipo_stock'] == 'NUEVO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
-                sin_recepcion_df = matches_df[matches_df['tipo_stock'] == 'SIN RECEPCIÓN'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
-                sin_stock_df = matches_df[matches_df['stock'] == 0] if not matches_df.empty else pd.DataFrame()
-                
-                total_stock_viejo = stock_viejo_df['stock_viejo'].sum() if not stock_viejo_df.empty else 0
-                total_stock_nuevo = stock_nuevo_df['stock_nuevo'].sum() if not stock_nuevo_df.empty else 0
-                total_diferencia = stock_viejo_df['diferencia'].sum() if not stock_viejo_df.empty else 0
-                
-                m1, m2, m3, m4 = st.columns(4)
-                m1.markdown(f'<div class="metric-card metric-card-red"><div class="metric-value">{len(stock_viejo_df)}</div><div class="metric-label">🔴 Stock Precio Viejo</div></div>', unsafe_allow_html=True)
-                m2.markdown(f'<div class="metric-card metric-card-green"><div class="metric-value">{len(stock_nuevo_df)}</div><div class="metric-label">🟢 Stock Precio Nuevo</div></div>', unsafe_allow_html=True)
-                m3.markdown(f'<div class="metric-card metric-card-gray"><div class="metric-value">{len(sin_stock_df)}</div><div class="metric-label">⚪ Sin Stock</div></div>', unsafe_allow_html=True)
-                m4.markdown(f'<div class="metric-card metric-card-orange"><div class="metric-value">${total_diferencia:,.2f}</div><div class="metric-label">💰 Diferencia Total</div></div>', unsafe_allow_html=True)
-                
-                # Métricas adicionales de cantidades
-                st.markdown('<div class="section-title">📦 Cantidades de Stock</div>', unsafe_allow_html=True)
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Stock con Precio Viejo", f"{total_stock_viejo:,.0f} unidades")
-                c2.metric("Stock con Precio Nuevo", f"{total_stock_nuevo:,.0f} unidades")
-                c3.metric("Total Stock", f"{total_stock_viejo + total_stock_nuevo:,.0f} unidades")
-                
-                # --- NO ENCONTRADOS ---
-                if not not_found.empty:
-                    st.markdown('<div class="section-title">❌ NO ENCONTRADOS EN BSALE</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="not-found-box"><strong>⚠️ {len(not_found)} modelos</strong> del PDF no se encontraron en Bsale.</div>', unsafe_allow_html=True)
-                    nf = not_found.copy()
-                    nf['precio_nuevo'] = nf['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                    st.dataframe(nf[['modelo_pdf', 'nombre', 'precio_nuevo', 'piezas_caja']], use_container_width=True, height=180)
-                
-                # --- TABS ---
-                st.markdown('<div class="section-title">📋 Detalle por Tipo de Stock</div>', unsafe_allow_html=True)
-                tab1, tab2, tab3, tab4 = st.tabs(["🔴 Stock Precio Viejo", "🟢 Stock Precio Nuevo", "⚪ Sin Stock", "❓ Sin Recepción"])
-                
-                with tab1:
-                    if not stock_viejo_df.empty:
-                        st.markdown(f'<div class="highlight-box"><strong>{len(stock_viejo_df)}</strong> productos con stock a precio viejo</div>', unsafe_allow_html=True)
-                        d = stock_viejo_df.copy()
-                        d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
-                        d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                        d['valor_viejo'] = d['valor_viejo'].apply(lambda x: f"${x:,.2f}")
-                        d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
-                        d['subida'] = d['subida'].apply(lambda x: f"${x:,.2f}")
-                        d['bajada'] = d['bajada'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'offices', 'costo_viejo', 'precio_nuevo', 'valor_viejo', 'diferencia', 'subida', 'bajada']], use_container_width=True, height=350)
-                        
-                        total_v = stock_viejo_df['valor_viejo'].sum()
-                        total_d = stock_viejo_df['diferencia'].sum()
-                        total_subida = stock_viejo_df['subida'].sum()
-                        total_bajada = stock_viejo_df['bajada'].sum()
-                        st.markdown('<div class="section-title">📝 Nota de Crédito (Stock Viejo)</div>', unsafe_allow_html=True)
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Valor Viejo", f"${total_v:,.2f}")
-                        c2.metric("Diferencia Total", f"${total_d:,.2f}")
-                        c3.metric("Subida de Precio", f"${total_subida:,.2f}")
-                        c4.metric("Bajada de Precio", f"${total_bajada:,.2f}")
+                    if not matches_export.empty and not not_found_export.empty:
+                        unified_df = pd.concat([matches_export, not_found_export], ignore_index=True)
+                    elif not matches_export.empty:
+                        unified_df = matches_export
+                    elif not not_found_export.empty:
+                        unified_df = not_found_export
                     else:
-                        st.success("✅ Ningún stock con precio viejo.")
-                
-                with tab2:
-                    if not stock_nuevo_df.empty:
-                        st.info(f"ℹ️ **{len(stock_nuevo_df)}** productos ya con precio nuevo")
-                        d = stock_nuevo_df.copy()
-                        d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_nuevo', 'offices', 'precio_nuevo']], use_container_width=True, height=250)
-                    else:
-                        st.info("No hay stock con precio nuevo.")
-                
-                with tab3:
-                    if not sin_stock_df.empty:
-                        st.info(f"ℹ️ **{len(sin_stock_df)}** sin stock")
-                        st.dataframe(sin_stock_df[['modelo_pdf', 'producto_bsale', 'variante', 'offices']], use_container_width=True, height=180)
-                    else:
-                        st.info("No hay.")
-                
-                with tab4:
-                    if not sin_recepcion_df.empty:
-                        st.warning(f"⚠️ **{len(sin_recepcion_df)}** productos sin historial de recepción")
-                        st.dataframe(sin_recepcion_df[['modelo_pdf', 'producto_bsale', 'variante', 'stock', 'offices']], use_container_width=True, height=180)
-                    else:
-                        st.info("Todos los productos tienen historial de recepción.")
-                
-                # --- DESCARGA UNIFICADA ---
-                # Preparar DataFrame unificado: encontrados + no encontrados
-                # Encontrados: marcar como "Encontrado"
-                matches_export = matches_df.copy() if not matches_df.empty else pd.DataFrame()
-                if not matches_export.empty:
-                    matches_export['estado'] = 'Encontrado'
-                
-                # No encontrados: agregar columnas vacías para que coincidan con el formato
-                not_found_export = not_found.copy() if not not_found.empty else pd.DataFrame()
-                if not not_found_export.empty:
-                    not_found_export['estado'] = 'No Encontrado'
-                    not_found_export['producto_bsale'] = ''
-                    not_found_export['variante'] = ''
-                    not_found_export['codigo'] = ''
-                    not_found_export['stock'] = 0
-                    not_found_export['variant_id'] = ''
-                    not_found_export['costo_viejo'] = 0
-                    not_found_export['valor_viejo'] = 0
-                    not_found_export['valor_nuevo'] = 0
-                    not_found_export['diferencia'] = 0
-                    not_found_export['subida'] = 0
-                    not_found_export['bajada'] = 0
-                    not_found_export['necesita_ajuste'] = False
-                
-                # Unir ambos
-                if not matches_export.empty and not not_found_export.empty:
-                    unified_df = pd.concat([matches_export, not_found_export], ignore_index=True)
-                elif not matches_export.empty:
-                    unified_df = matches_export
-                elif not not_found_export.empty:
-                    unified_df = not_found_export
+                        unified_df = pd.DataFrame()
+                    
+                    if not unified_df.empty:
+                        st.download_button(
+                            "⬇️ Descargar Arqueo Completo (CSV)", 
+                            unified_df.to_csv(index=False).encode('utf-8'), 
+                            f"arqueo_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", 
+                            "text/csv", 
+                            use_container_width=True
+                        )
+                    
+                    if not matches_df.empty:
+                        st.download_button("⬇️ Solo Encontrados (CSV)", matches_df.to_csv(index=False).encode('utf-8'), f"arqueo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
+                    if not not_found.empty:
+                        st.download_button("⬇️ Solo No Encontrados (CSV)", not_found.to_csv(index=False).encode('utf-8'), f"no_encontrados_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
+            else:
+                st.error("❌ No se extrajeron modelos del PDF.")
+
+# ============================================================
+# TAB 2: HISTORIAL DE ARQUEOS
+# ============================================================
+with tab_historial:
+    st.markdown('<div class="section-title">📋 Historial de Arqueos Guardados</div>', unsafe_allow_html=True)
+    
+    arqueos = load_arqueos_index()
+    notas = load_notas_credito()
+    arqueos_con_nc = set(n['arqueo_id'] for n in notas)
+    
+    if not arqueos:
+        st.info("ℹ️ No hay arqueos guardados aún. Realiza un arqueo en la pestaña 📊 Arqueo.")
+    else:
+        st.write(f"📁 **{len(arqueos)}** arqueos guardados")
+        
+        # Mostrar tabla de arqueos
+        for arqueo in arqueos:
+            col1, col2, col3, col4, col5 = st.columns([2, 2, 1, 1, 1])
+            
+            with col1:
+                st.write(f"**🆔 {arqueo['id']}**")
+                st.caption(f"📅 {arqueo['fecha']}")
+            
+            with col2:
+                archivos = arqueo.get('archivos', [])
+                st.write(f"📄 {', '.join(archivos[:2])}{'...' if len(archivos) > 2 else ''}")
+            
+            with col3:
+                stats = arqueo.get('stats', {})
+                st.write(f"🔴 {stats.get('total_encontrados', 0)} encontrados")
+            
+            with col4:
+                tiene_nc = arqueo['id'] in arqueos_con_nc
+                if tiene_nc:
+                    st.success("💳 Con NC")
                 else:
-                    unified_df = pd.DataFrame()
-                
-                if not unified_df.empty:
+                    st.warning("Sin NC")
+            
+            with col5:
+                df_arqueo = load_arqueo_csv(arqueo['id'])
+                if not df_arqueo.empty:
                     st.download_button(
-                        "⬇️ Descargar Arqueo Completo (CSV)", 
-                        unified_df.to_csv(index=False).encode('utf-8'), 
-                        f"arqueo_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", 
-                        "text/csv", 
-                        use_container_width=True
+                        "⬇️ CSV",
+                        df_arqueo.to_csv(index=False).encode('utf-8'),
+                        f"arqueo_{arqueo['id']}.csv",
+                        "text/csv",
+                        key=f"dl_{arqueo['id']}"
                     )
+            
+            st.divider()
+
+# ============================================================
+# TAB 3: NOTAS DE CRÉDITO
+# ============================================================
+with tab_notas:
+    st.markdown('<div class="section-title">💳 Registrar Pago de Nota de Crédito</div>', unsafe_allow_html=True)
+    
+    arqueos = load_arqueos_index()
+    notas = load_notas_credito()
+    arqueos_con_nc = set(n['arqueo_id'] for n in notas)
+    
+    if not arqueos:
+        st.warning("⚠️ Primero debes realizar al menos un arqueo en la pestaña 📊 Arqueo.")
+    else:
+        # Filtrar arqueos sin nota de crédito
+        arqueos_sin_nc = [a for a in arqueos if a['id'] not in arqueos_con_nc]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📝 Nuevo Pago")
+            
+            if arqueos_sin_nc:
+                opciones = {f"{a['id']} — {a['fecha']} — {a.get('stats', {}).get('total_encontrados', 0)} encontrados": a['id'] for a in arqueos_sin_nc}
+                seleccion = st.selectbox("Seleccionar Arqueo", list(opciones.keys()))
+                arqueo_id = opciones[seleccion]
                 
-                # Descargas separadas (opcional, por si las necesita)
-                if not matches_df.empty:
-                    st.download_button("⬇️ Solo Encontrados (CSV)", matches_df.to_csv(index=False).encode('utf-8'), f"arqueo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
-                if not not_found.empty:
-                    st.download_button("⬇️ Solo No Encontrados (CSV)", not_found.to_csv(index=False).encode('utf-8'), f"no_encontrados_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv", use_container_width=True)
-        else:
-            st.error("❌ No se extrajeron modelos del PDF.")
+                fecha_pago = st.date_input("Fecha del pago", value=date.today())
+                monto = st.number_input("Monto del pago ($)", min_value=0.0, step=0.01, format="%.2f")
+                descripcion = st.text_area("Descripción (opcional)", placeholder="Ej: Pago de diferencia de precios...")
+                
+                if st.button("💾 Registrar Pago", type="primary"):
+                    nota_id = save_nota_credito(arqueo_id, fecha_pago.strftime('%Y-%m-%d'), monto, descripcion)
+                    st.success(f"✅ Nota de crédito registrada: **{nota_id}**")
+                    st.rerun()
+            else:
+                st.info("ℹ️ Todos los arqueos ya tienen nota de crédito registrada.")
+        
+        with col2:
+            st.subheader("📋 Historial de Notas de Crédito")
+            
+            if not notas:
+                st.info("No hay notas de crédito registradas.")
+            else:
+                for nota in reversed(notas):
+                    arqueo_info = next((a for a in arqueos if a['id'] == nota['arqueo_id']), None)
+                    arqueo_fecha = arqueo_info['fecha'] if arqueo_info else 'Desconocido'
+                    
+                    st.markdown(f"""
+                    <div style="border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:8px;">
+                        <b>{nota['id']}</b> — <span style="color:#666">{nota['fecha_pago']}</span><br>
+                        🆔 Arqueo: <b>{nota['arqueo_id']}</b> ({arqueo_fecha})<br>
+                        💰 Monto: <b>${nota['monto']:,.2f}</b><br>
+                        📝 {nota.get('descripcion', 'Sin descripción')}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+# ============================================================
+# TAB 4: ARQUEO POR FECHA
+# ============================================================
+with tab_fecha:
+    st.markdown('<div class="section-title">🔍 Arqueo por Fecha de Referencia</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="highlight-box">
+    Este modo calcula la diferencia de precios <b>solo para productos que recibieron stock después de la fecha de referencia</b>.
+    Útil cuando ya pagaste una nota de crédito y quieres calcular solo las nuevas recepciones.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Seleccionar arqueo base (que ya tiene nota de crédito)
+    arqueos = load_arqueos_index()
+    notas = load_notas_credito()
+    arqueos_con_nc = set(n['arqueo_id'] for n in notas)
+    
+    if not arqueos_con_nc:
+        st.warning("⚠️ No hay arqueos con nota de crédito. Primero registra un pago en la pestaña 💳 Notas de Crédito.")
+    else:
+        arqueos_base = [a for a in arqueos if a['id'] in arqueos_con_nc]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            opciones = {f"{a['id']} — {a['fecha']}": a['id'] for a in arqueos_base}
+            seleccion = st.selectbox("Arqueo con Nota de Crédito (referencia)", list(opciones.keys()))
+            arqueo_ref_id = opciones[seleccion]
+            
+            # Obtener fecha de la nota de crédito
+            ultima_fecha_nc = get_ultima_fecha_nota_credito(arqueo_ref_id)
+            if ultima_fecha_nc:
+                st.success(f"💳 Última NC: **{ultima_fecha_nc}**")
+                fecha_ref = st.date_input("Fecha de referencia", value=datetime.strptime(ultima_fecha_nc, '%Y-%m-%d').date())
+            else:
+                fecha_ref = st.date_input("Fecha de referencia", value=date.today())
+        
+        with col2:
+            st.subheader("📁 PDF de Precios Nuevos")
+            uploaded_file_fecha = st.file_uploader("Subir PDF de lista VIP", type=['pdf'], key="fecha_pdf")
+        
+        if uploaded_file_fecha and fecha_ref:
+            with st.spinner("Extrayendo datos del PDF..."):
+                pdf_data_fecha = extract_pdf_data(io.BytesIO(uploaded_file_fecha.read()))
+            
+            st.success(f"✅ **{len(pdf_data_fecha)}** modelos extraídos")
+            
+            if st.button("🚀 ARQUEAR POR FECHA", type="primary", use_container_width=True):
+                if st.session_state.bsale_df is None or st.session_state.bsale_df.empty:
+                    st.error("❌ Primero carga el inventario Bsale en la pestaña 📊 Arqueo > Paso 1.")
+                else:
+                    with st.spinner("Buscando en Bsale y filtrando por fecha de recepción..."):
+                        matches_df, not_found = do_arqueo_fast(pdf_data_fecha, st.session_state.bsale_df)
+                    
+                    if matches_df.empty:
+                        st.warning("⚠️ No se encontraron coincidencias.")
+                    else:
+                        matches_df['costo_viejo'] = matches_df['costo_viejo'].astype(float)
+                        matches_df['stock'] = matches_df['stock'].astype(float)
+                        
+                        variant_ids = matches_df['variant_id'].unique().tolist()
+                        st.write(f"🔍 Buscando historial de recepciones para {len(variant_ids)} variantes...")
+                        reception_history = get_reception_history_for_variants(variant_ids)
+                        st.write(f"✅ Historial obtenido: {len(reception_history)} variantes con recepciones")
+                        
+                        fecha_ref_str = fecha_ref.strftime('%Y-%m-%d')
+                        productos_con_recepcion_post = 0
+                        
+                        for idx, row in matches_df.iterrows():
+                            v_id = str(row['variant_id'])
+                            precio_nuevo = row['precio_nuevo']
+                            stock_total = row['stock']
+                            
+                            if v_id in reception_history and stock_total > 0:
+                                history = reception_history[v_id]
+                                
+                                # Verificar si hay recepciones DESPUÉS de la fecha de referencia
+                                recepciones_post = [r for r in history if r.get('date', '') > fecha_ref_str]
+                                
+                                if recepciones_post:
+                                    productos_con_recepcion_post += 1
+                                    # Calcular FIFO para el stock actual
+                                    fifo_result = calculate_fifo_stock(stock_total, history)
+                                    
+                                    stock_viejo = 0
+                                    stock_nuevo = 0
+                                    costo_viejo_promedio = 0
+                                    
+                                    for lot in fifo_result:
+                                        if abs(lot['cost'] - precio_nuevo) < 0.01:
+                                            stock_nuevo += lot['quantity']
+                                        else:
+                                            stock_viejo += lot['quantity']
+                                    
+                                    if stock_viejo > 0:
+                                        viejo_lots = [lot for lot in fifo_result if abs(lot['cost'] - precio_nuevo) >= 0.01]
+                                        if viejo_lots:
+                                            costo_viejo_promedio = sum(lot['cost'] * lot['quantity'] for lot in viejo_lots) / stock_viejo
+                                    
+                                    matches_df.loc[idx, 'stock_viejo'] = stock_viejo
+                                    matches_df.loc[idx, 'stock_nuevo'] = stock_nuevo
+                                    matches_df.loc[idx, 'costo_viejo'] = costo_viejo_promedio if costo_viejo_promedio > 0 else row['costo_viejo']
+                                    matches_df.loc[idx, 'tipo_stock'] = 'VIEJO' if stock_viejo > 0 else 'NUEVO' if stock_nuevo > 0 else 'SIN RECEPCIÓN'
+                                    matches_df.loc[idx, 'recepcion_post'] = True
+                                    matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in recepciones_post)
+                                else:
+                                    matches_df.loc[idx, 'stock_viejo'] = 0
+                                    matches_df.loc[idx, 'stock_nuevo'] = 0
+                                    matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCION_POST'
+                                    matches_df.loc[idx, 'recepcion_post'] = False
+                                    matches_df.loc[idx, 'ultima_recepcion'] = max(r.get('date', '') for r in history) if history else ''
+                            else:
+                                matches_df.loc[idx, 'stock_viejo'] = stock_total
+                                matches_df.loc[idx, 'stock_nuevo'] = 0
+                                matches_df.loc[idx, 'tipo_stock'] = 'SIN RECEPCIÓN'
+                                matches_df.loc[idx, 'recepcion_post'] = False
+                                matches_df.loc[idx, 'ultima_recepcion'] = ''
+                        
+                        # Filtrar solo productos con recepción posterior
+                        matches_df = matches_df[matches_df['recepcion_post'] == True].copy() if 'recepcion_post' in matches_df.columns else pd.DataFrame()
+                        
+                        if matches_df.empty:
+                            st.warning("⚠️ Ninguno de los productos encontrados tiene recepciones después de la fecha de referencia.")
+                        else:
+                            st.success(f"✅ **{len(matches_df)}** productos con recepciones después de {fecha_ref_str}")
+                            
+                            matches_df['valor_viejo'] = matches_df['stock_viejo'] * matches_df['costo_viejo']
+                            matches_df['valor_nuevo'] = matches_df['stock_nuevo'] * matches_df['precio_nuevo']
+                            
+                            matches_df['diferencia'] = 0.0
+                            mask_valid = (matches_df['precio_nuevo'] > 0) & (matches_df['costo_viejo'] > 0)
+                            matches_df.loc[mask_valid, 'diferencia'] = (
+                                matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'precio_nuevo']
+                            ) - (
+                                matches_df.loc[mask_valid, 'stock'] * matches_df.loc[mask_valid, 'costo_viejo']
+                            )
+                            
+                            matches_df['subida'] = 0.0
+                            mask_subida = mask_valid & (matches_df['precio_nuevo'] > matches_df['costo_viejo'])
+                            matches_df.loc[mask_subida, 'subida'] = matches_df.loc[mask_subida, 'diferencia']
+                            
+                            matches_df['bajada'] = 0.0
+                            mask_bajada = mask_valid & (matches_df['precio_nuevo'] < matches_df['costo_viejo'])
+                            matches_df.loc[mask_bajada, 'bajada'] = matches_df.loc[mask_bajada, 'diferencia']
+                            
+                            if 'offices' not in matches_df.columns:
+                                matches_df['offices'] = ''
+                            
+                            # --- RESUMEN ---
+                            st.markdown('<div class="section-title">📊 Resumen del Arqueo por Fecha</div>', unsafe_allow_html=True)
+                            
+                            stock_viejo_df = matches_df[matches_df['tipo_stock'] == 'VIEJO'] if 'tipo_stock' in matches_df.columns else pd.DataFrame()
+                            total_diferencia = stock_viejo_df['diferencia'].sum() if not stock_viejo_df.empty else 0
+                            total_stock_viejo = stock_viejo_df['stock_viejo'].sum() if not stock_viejo_df.empty else 0
+                            
+                            m1, m2, m3 = st.columns(3)
+                            m1.metric("Productos con Recepción Posterior", len(matches_df))
+                            m2.metric("Stock Precio Viejo", f"{total_stock_viejo:,.0f} unidades")
+                            m3.metric("Diferencia Total", f"${total_diferencia:,.2f}")
+                            
+                            # Mostrar detalle
+                            if not stock_viejo_df.empty:
+                                st.markdown('<div class="section-title">🔴 Detalle — Stock con Precio Viejo (Recepciones Posteriores)</div>', unsafe_allow_html=True)
+                                d = stock_viejo_df.copy()
+                                d['costo_viejo'] = d['costo_viejo'].apply(lambda x: f"${x:,.2f}")
+                                d['precio_nuevo'] = d['precio_nuevo'].apply(lambda x: f"${x:,.2f}")
+                                d['diferencia'] = d['diferencia'].apply(lambda x: f"${x:,.2f}")
+                                d['ultima_recepcion'] = d['ultima_recepcion'].fillna('')
+                                st.dataframe(d[['modelo_pdf', 'producto_bsale', 'variante', 'stock_viejo', 'ultima_recepcion', 'costo_viejo', 'precio_nuevo', 'diferencia']], use_container_width=True, height=350)
+                            
+                            # Descarga
+                            if not matches_df.empty:
+                                st.download_button(
+                                    "⬇️ Descargar Arqueo por Fecha (CSV)",
+                                    matches_df.to_csv(index=False).encode('utf-8'),
+                                    f"arqueo_fecha_{fecha_ref.strftime('%Y%m%d')}_{datetime.now().strftime('%H%M')}.csv",
+                                    "text/csv",
+                                    use_container_width=True
+                                )
 
 st.markdown("""<div style="text-align: center; color: #888; margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #e9ecef;">Bsale Arqueo PDF | Ultra-rápido</div>""", unsafe_allow_html=True)
